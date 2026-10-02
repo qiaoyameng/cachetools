@@ -1,3 +1,9 @@
+v7.2.1 (unreleased)
+===================
+
+- Add bounded, aging ``TinyLFU`` and ``FrequencySketch`` admission
+  policies that can be composed with cache implementations.
+
 v7.2.0 (2026-09-16)
 ===================
 

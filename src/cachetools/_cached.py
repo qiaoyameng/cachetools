@@ -11,6 +11,17 @@ import warnings
 # info.
 
 
+def _setdefault(cache, key, value):
+    try:
+        setitem = cache._setitem
+    except AttributeError:
+        return cache.setdefault(key, value)
+    if key in cache:
+        return cache[key]
+    setitem(key, value)
+    return None
+
+
 def _condition_info(func, cache, key, lock, cond, info):
     hits = misses = 0
     pending = set()
@@ -31,7 +42,7 @@ def _condition_info(func, cache, key, lock, cond, info):
             v = func(*args, **kwargs)
             with lock:
                 try:
-                    cache[k] = v
+                    _setdefault(cache, k, v)
                 except ValueError:
                     pass  # value too large
                 return v
@@ -74,7 +85,8 @@ def _locked_info(func, cache, key, lock, info):
                 # In case of a race condition, i.e. if another thread
                 # stored a value for this key while we were calling
                 # func(), prefer the cached value.
-                return cache.setdefault(k, v)
+                stored = _setdefault(cache, k, v)
+                return v if stored is None or stored is False else stored
             except ValueError:
                 return v  # value too large
 
@@ -107,7 +119,7 @@ def _unlocked_info(func, cache, key, info):
             misses += 1
         v = func(*args, **kwargs)
         try:
-            cache[k] = v
+            _setdefault(cache, k, v)
         except ValueError:
             pass  # value too large
         return v
@@ -158,7 +170,7 @@ def _condition(func, cache, key, lock, cond):
             v = func(*args, **kwargs)
             with lock:
                 try:
-                    cache[k] = v
+                    _setdefault(cache, k, v)
                 except ValueError:
                     pass  # value too large
                 return v
@@ -189,7 +201,8 @@ def _locked(func, cache, key, lock):
                 # In case of a race condition, i.e. if another thread
                 # stored a value for this key while we were calling
                 # func(), prefer the cached value.
-                return cache.setdefault(k, v)
+                stored = _setdefault(cache, k, v)
+                return v if stored is None or stored is False else stored
             except ValueError:
                 return v  # value too large
 
@@ -210,7 +223,7 @@ def _unlocked(func, cache, key):
             pass  # key not found
         v = func(*args, **kwargs)
         try:
-            cache[k] = v
+            _setdefault(cache, k, v)
         except ValueError:
             pass  # value too large
         return v

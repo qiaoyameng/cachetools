@@ -3,9 +3,11 @@
 __all__ = (
     "Cache",
     "FIFOCache",
+    "FrequencySketch",
     "LFUCache",
     "LRUCache",
     "RRCache",
+    "TinyLFU",
     "TLRUCache",
     "TTLCache",
     "cached",
@@ -18,10 +20,159 @@ import collections
 import collections.abc
 import functools
 import heapq
+import math
 import random
 import time
 
 from . import keys
+
+
+def _fnv1a(data, seed):
+    value = seed
+    for byte in data:
+        value = ((value ^ byte) * 0x01000193) & 0xFFFFFFFF
+    return value
+
+
+def _stable_hashes(key):
+    data = repr(key).encode("utf-8", "surrogatepass")
+    return (
+        _fnv1a(data, 0x811C9DC5),
+        _fnv1a(data, 0x517CC1B7) | 1,
+    )
+
+
+class FrequencySketch:
+    """A bounded Count-Min sketch for approximate key frequencies."""
+
+    __slots__ = (
+        "_counters",
+        "_depth",
+        "_hasher",
+        "_sample_count",
+        "_sample_size",
+        "_width",
+    )
+
+    def __init__(self, width, depth=4, *, hasher=None, sample_size=None):
+        width = int(width)
+        depth = int(depth)
+        if width <= 0:
+            raise ValueError("width must be positive")
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        if sample_size is None:
+            sample_size = width * 10
+        sample_size = int(sample_size)
+        if sample_size <= 0:
+            raise ValueError("sample_size must be positive")
+        self._width = width
+        self._depth = depth
+        self._hasher = hasher or _stable_hashes
+        self._sample_size = sample_size
+        self._sample_count = 0
+        self._counters = bytearray(width * depth)
+
+    @property
+    def width(self):
+        """The number of counters per sketch row."""
+        return self._width
+
+    @property
+    def depth(self):
+        """The number of independent counter rows."""
+        return self._depth
+
+    @property
+    def sample_size(self):
+        """The number of additions between two aging operations."""
+        return self._sample_size
+
+    @property
+    def sample_count(self):
+        """The number of additions since the last aging operation."""
+        return self._sample_count
+
+    @property
+    def memory_size(self):
+        """The fixed number of bytes used by counters."""
+        return len(self._counters)
+
+    def add(self, key):
+        """Record one access to `key`."""
+        for position in self._positions(key):
+            if self._counters[position] < 15:
+                self._counters[position] += 1
+        self._sample_count += 1
+        if self._sample_count >= self._sample_size:
+            self.age()
+
+    def frequency(self, key):
+        """Return the estimated access frequency for `key`."""
+        counters = self._counters
+        return min(counters[position] for position in self._positions(key))
+
+    def estimate(self, key):
+        """Return the estimated access frequency for `key`."""
+        return self.frequency(key)
+
+    def age(self):
+        """Halve all counters and start a new sampling window."""
+        counters = self._counters
+        for position, value in enumerate(counters):
+            counters[position] = value >> 1
+        self._sample_count = 0
+
+    def clear(self):
+        """Reset all counters and sampling state."""
+        self._counters[:] = b"\x00" * len(self._counters)
+        self._sample_count = 0
+
+    def _positions(self, key):
+        first, second = self._hasher(key)
+        width = self._width
+        return [(first + row * second) % width for row in range(self._depth)]
+
+
+class TinyLFU:
+    """TinyLFU admission policy based on a frequency sketch."""
+
+    __slots__ = ("_sketch",)
+
+    def __init__(
+        self, capacity=128, *, depth=4, hasher=None, sample_size=None
+    ):
+        if not math.isfinite(capacity) or capacity < 0:
+            raise ValueError("capacity must be a finite non-negative number")
+        width = max(1, math.ceil(capacity))
+        self._sketch = FrequencySketch(
+            width, depth, hasher=hasher, sample_size=sample_size
+        )
+
+    @property
+    def sketch(self):
+        """The bounded frequency sketch used by this policy."""
+        return self._sketch
+
+    def record(self, key):
+        """Record an access to `key`."""
+        self._sketch.add(key)
+
+    def frequency(self, key):
+        """Return the estimated access frequency for `key`."""
+        return self._sketch.frequency(key)
+
+    def estimate(self, key):
+        """Return the estimated access frequency for `key`."""
+        return self.frequency(key)
+
+    def admit(self, key, candidate):
+        """Return whether `key` may replace `candidate`."""
+        return self._sketch.frequency(key) > self._sketch.frequency(candidate)
+
+    def clear(self):
+        """Reset the admission policy."""
+        self._sketch.clear()
 
 
 class _DefaultSize:
@@ -49,7 +200,7 @@ class Cache(collections.abc.MutableMapping):
 
     __size = _DefaultSize()
 
-    def __init__(self, maxsize, getsizeof=None):
+    def __init__(self, maxsize, getsizeof=None, *, admission=None):
         if maxsize < 0:
             raise ValueError("maxsize must be non-negative")
         if getsizeof:
@@ -59,6 +210,7 @@ class Cache(collections.abc.MutableMapping):
         self.__data = {}
         self.__currsize = 0
         self.__maxsize = maxsize
+        self.__admission = admission
 
     def __repr__(self):
         return "%s(%s, maxsize=%r, currsize=%r)" % (
@@ -69,22 +221,42 @@ class Cache(collections.abc.MutableMapping):
         )
 
     def __getitem__(self, key):
-        try:
-            return self.__data[key]
-        except KeyError:
+        if key not in self.__data:
             return self.__missing__(key)
+        value = self.__data[key]
+        if self.__admission is not None:
+            self.__admission.record(key)
+        return value
 
     def __setitem__(self, key, value):
+        self._setitem(key, value)
+
+    def _setitem(self, key, value):
         maxsize = self.__maxsize
         size = self.getsizeof(value)
         if size < 0:
             raise ValueError("value size must be non-negative")
         if size > maxsize:
             raise ValueError("value too large")
+        admission = self.__admission
+        if admission is not None:
+            admission.record(key)
         if key not in self.__data:
             diffsize = size
-            while self.__currsize + diffsize > maxsize:
-                self.popitem()
+            if self.__currsize + diffsize > maxsize:
+                candidates, evicted, restore = self._eviction_plan(
+                    self.__currsize + diffsize - maxsize
+                )
+                if admission is not None:
+                    for candidate in candidates:
+                        if not admission.admit(key, candidate):
+                            if restore:
+                                self._restore_evicted(evicted)
+                            return False
+                if restore:
+                    self._commit_evicted(evicted)
+                for candidate in candidates:
+                    del self[candidate]
         else:
             diffsize = size - self.__size[key]
             while self.__currsize + diffsize > maxsize:
@@ -94,6 +266,82 @@ class Cache(collections.abc.MutableMapping):
         self.__data[key] = value
         self.__size[key] = size
         self.__currsize += diffsize
+        return True
+
+    def _eviction_plan(self, required_size):
+        builtin_popitems = (
+            Cache.popitem,
+            FIFOCache.popitem,
+            LFUCache.popitem,
+            LRUCache.popitem,
+            RRCache.popitem,
+            TTLCache.popitem,
+            TLRUCache.popitem,
+        )
+        if type(self).popitem not in builtin_popitems:
+            return self._custom_eviction_plan(required_size)
+        candidates = []
+        released_size = 0
+        selected = set()
+        while released_size < required_size:
+            try:
+                candidate = self._eviction_candidate(exclude=selected)
+            except (IndexError, StopIteration):
+                raise KeyError(
+                    "%s is empty" % type(self).__name__
+                ) from None
+            if candidate not in self or candidate in selected:
+                raise KeyError("%s is empty" % type(self).__name__) from None
+            selected.add(candidate)
+            candidates.append(candidate)
+            released_size += self.__size[candidate]
+        return candidates, [], False
+
+    def _custom_eviction_plan(self, required_size):
+        evicted = []
+        candidates = []
+        released_size = 0
+        while released_size < required_size:
+            previous_size = self.__currsize
+            try:
+                candidate, value = self.popitem()
+            except KeyError:
+                self._restore_evicted(evicted)
+                raise
+            size = previous_size - self.__currsize
+            evicted.append((candidate, value, size))
+            candidates.append(candidate)
+            released_size += size
+        return candidates, evicted, True
+
+    def _restore_evicted(self, evicted):
+        for candidate, value, _size in reversed(evicted):
+            self.__setitem__(candidate, value)
+
+    def _commit_evicted(self, evicted):
+        pass
+
+    def _eviction_candidate(self, exclude=()):
+        for candidate in self:
+            if candidate not in exclude:
+                return candidate
+        raise StopIteration
+
+    def _peek(self, key):
+        return self.__data[key]
+
+    def _discard(self, key):
+        value = self.__data[key]
+        type(self).__delitem__(self, key)
+        return value
+
+    def popitem(self):
+        """Remove and return an arbitrary `(key, value)` pair."""
+        try:
+            key = self._eviction_candidate()
+        except (IndexError, StopIteration):
+            raise KeyError("%s is empty" % type(self).__name__) from None
+        return (key, self._discard(key))
 
     def __delitem__(self, key):
         size = self.__size.pop(key)
@@ -171,12 +419,21 @@ class Cache(collections.abc.MutableMapping):
 class FIFOCache(Cache):
     """First In First Out (FIFO) cache implementation."""
 
-    def __init__(self, maxsize, getsizeof=None):
-        Cache.__init__(self, maxsize, getsizeof)
+    def __init__(self, maxsize, getsizeof=None, *, admission=None):
+        Cache.__init__(self, maxsize, getsizeof, admission=admission)
         self.__order = collections.OrderedDict()
 
-    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
-        cache_setitem(self, key, value)
+    def __setitem__(self, key, value):
+        Cache.__setitem__(self, key, value)
+        self.__track(key)
+
+    def _setitem(self, key, value, cache_setitem=Cache._setitem):
+        if not cache_setitem(self, key, value):
+            return False
+        self.__track(key)
+        return True
+
+    def __track(self, key):
         if key in self.__order:
             self.__order.move_to_end(key)
         else:
@@ -193,7 +450,13 @@ class FIFOCache(Cache):
         except StopIteration:
             raise KeyError("%s is empty" % type(self).__name__) from None
         else:
-            return (key, self.pop(key))
+            return (key, self._discard(key))
+
+    def _eviction_candidate(self, exclude=()):
+        for candidate in self.__order:
+            if candidate not in exclude:
+                return candidate
+        raise StopIteration
 
     def clear(self):
         Cache.clear(self)
@@ -216,8 +479,8 @@ class LFUCache(Cache):
             prev.next = next
             next.prev = prev
 
-    def __init__(self, maxsize, getsizeof=None):
-        Cache.__init__(self, maxsize, getsizeof)
+    def __init__(self, maxsize, getsizeof=None, *, admission=None):
+        Cache.__init__(self, maxsize, getsizeof, admission=admission)
         self.__root = root = LFUCache._Link(0)  # sentinel
         root.prev = root.next = root
         self.__links = {}
@@ -228,11 +491,15 @@ class LFUCache(Cache):
             self.__touch(key)
         return value
 
-    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
-        cache_setitem(self, key, value)
+    def __setitem__(self, key, value):
+        Cache.__setitem__(self, key, value)
+
+    def _setitem(self, key, value, cache_setitem=Cache._setitem):
+        if not cache_setitem(self, key, value):
+            return False
         if key in self.__links:
             self.__touch(key)
-            return
+            return True
         root = self.__root
         link = root.next
         if link.count != 1:
@@ -257,7 +524,17 @@ class LFUCache(Cache):
         if curr is root:
             raise KeyError("%s is empty" % type(self).__name__) from None
         key = next(iter(curr.keys))  # remove an arbitrary element
-        return (key, self.pop(key))
+        return (key, self._discard(key))
+
+    def _eviction_candidate(self, exclude=()):
+        root = self.__root
+        link = root.next
+        while link is not root:
+            for candidate in link.keys:
+                if candidate not in exclude:
+                    return candidate
+            link = link.next
+        raise StopIteration
 
     def clear(self):
         Cache.clear(self)
@@ -287,8 +564,8 @@ class LFUCache(Cache):
 class LRUCache(Cache):
     """Least Recently Used (LRU) cache implementation."""
 
-    def __init__(self, maxsize, getsizeof=None):
-        Cache.__init__(self, maxsize, getsizeof)
+    def __init__(self, maxsize, getsizeof=None, *, admission=None):
+        Cache.__init__(self, maxsize, getsizeof, admission=admission)
         self.__order = collections.OrderedDict()
 
     def __getitem__(self, key, cache_getitem=Cache.__getitem__):
@@ -297,9 +574,15 @@ class LRUCache(Cache):
             self.__touch(key)
         return value
 
-    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
-        cache_setitem(self, key, value)
+    def __setitem__(self, key, value):
+        Cache.__setitem__(self, key, value)
         self.__touch(key)
+
+    def _setitem(self, key, value, cache_setitem=Cache._setitem):
+        if cache_setitem(self, key, value):
+            self.__touch(key)
+            return True
+        return False
 
     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
         cache_delitem(self, key)
@@ -312,7 +595,13 @@ class LRUCache(Cache):
         except StopIteration:
             raise KeyError("%s is empty" % type(self).__name__) from None
         else:
-            return (key, self.pop(key))
+            return (key, self._discard(key))
+
+    def _eviction_candidate(self, exclude=()):
+        for candidate in self.__order:
+            if candidate not in exclude:
+                return candidate
+        raise StopIteration
 
     def clear(self):
         Cache.clear(self)
@@ -329,8 +618,15 @@ class LRUCache(Cache):
 class RRCache(Cache):
     """Random Replacement (RR) cache implementation."""
 
-    def __init__(self, maxsize, choice=random.choice, getsizeof=None):
-        Cache.__init__(self, maxsize, getsizeof)
+    def __init__(
+        self,
+        maxsize,
+        choice=random.choice,
+        getsizeof=None,
+        *,
+        admission=None,
+    ):
+        Cache.__init__(self, maxsize, getsizeof, admission=admission)
         self.__choice = choice
         self.__index = {}
         self.__keys = []
@@ -340,8 +636,17 @@ class RRCache(Cache):
         """The `choice` function used by the cache."""
         return self.__choice
 
-    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
-        cache_setitem(self, key, value)
+    def __setitem__(self, key, value):
+        Cache.__setitem__(self, key, value)
+        self.__track(key)
+
+    def _setitem(self, key, value, cache_setitem=Cache._setitem):
+        if not cache_setitem(self, key, value):
+            return False
+        self.__track(key)
+        return True
+
+    def __track(self, key):
         if key not in self.__index:
             self.__index[key] = len(self.__keys)
             self.__keys.append(key)
@@ -362,7 +667,11 @@ class RRCache(Cache):
         except IndexError:
             raise KeyError("%s is empty" % type(self).__name__) from None
         else:
-            return (key, self.pop(key))
+            return (key, self._discard(key))
+
+    def _eviction_candidate(self, exclude=()):
+        available = [key for key in self.__keys if key not in exclude]
+        return self.__choice(available)
 
     def clear(self):
         Cache.clear(self)
@@ -401,8 +710,8 @@ class _TimedCache(Cache):
         def __getattr__(self, name):
             return getattr(self.__timer, name)
 
-    def __init__(self, maxsize, timer, getsizeof=None):
-        Cache.__init__(self, maxsize, getsizeof)
+    def __init__(self, maxsize, timer, getsizeof=None, *, admission=None):
+        Cache.__init__(self, maxsize, getsizeof, admission=admission)
         self.__timer = _TimedCache._Timer(timer)
 
     def __repr__(self, cache_repr=Cache.__repr__):
@@ -467,8 +776,16 @@ class TTLCache(_TimedCache):
             prev.next = next
             next.prev = prev
 
-    def __init__(self, maxsize, ttl, timer=time.monotonic, getsizeof=None):
-        _TimedCache.__init__(self, maxsize, timer, getsizeof)
+    def __init__(
+        self,
+        maxsize,
+        ttl,
+        timer=time.monotonic,
+        getsizeof=None,
+        *,
+        admission=None,
+    ):
+        _TimedCache.__init__(self, maxsize, timer, getsizeof, admission=admission)
         self.__root = root = TTLCache._Link()
         root.prev = root.next = root
         self.__links = collections.OrderedDict()
@@ -494,10 +811,15 @@ class TTLCache(_TimedCache):
         else:
             return cache_getitem(self, key)
 
-    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+    def __setitem__(self, key, value):
+        self._setitem(key, value)
+
+    def _setitem(self, key, value, cache_setitem=Cache._setitem):
         with self.timer as time:
             self.expire(time)
-            cache_setitem(self, key, value)
+            stored = cache_setitem(self, key, value)
+        if not stored:
+            return False
         try:
             link = self.__getlink(key)
         except KeyError:
@@ -508,6 +830,7 @@ class TTLCache(_TimedCache):
         link.next = root = self.__root
         link.prev = prev = root.prev
         prev.next = root.prev = link
+        return True
 
     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
         cache_delitem(self, key)
@@ -553,9 +876,8 @@ class TTLCache(_TimedCache):
         links = self.__links
         expired = []
         cache_delitem = Cache.__delitem__
-        cache_getitem = Cache.__getitem__
         while curr is not root and not (time < curr.expires):
-            expired.append((curr.key, cache_getitem(self, curr.key)))
+            expired.append((curr.key, self._peek(curr.key)))
             cache_delitem(self, curr.key)
             del links[curr.key]
             next = curr.next
@@ -575,7 +897,15 @@ class TTLCache(_TimedCache):
             except StopIteration:
                 raise KeyError("%s is empty" % type(self).__name__) from None
             else:
-                return (key, self.pop(key))
+                return (key, self._discard(key))
+
+    def _eviction_candidate(self, exclude=()):
+        with self.timer as time:
+            self.expire(time)
+            for candidate in self.__links:
+                if candidate not in exclude:
+                    return candidate
+        raise StopIteration
 
     def clear(self):
         _TimedCache.clear(self)
@@ -606,8 +936,16 @@ class TLRUCache(_TimedCache):
         def __lt__(self, other):
             return self.expires < other.expires
 
-    def __init__(self, maxsize, ttu, timer=time.monotonic, getsizeof=None):
-        _TimedCache.__init__(self, maxsize, timer, getsizeof)
+    def __init__(
+        self,
+        maxsize,
+        ttu,
+        timer=time.monotonic,
+        getsizeof=None,
+        *,
+        admission=None,
+    ):
+        _TimedCache.__init__(self, maxsize, timer, getsizeof, admission=admission)
         self.__items = collections.OrderedDict()
         self.__order = []
         self.__ttu = ttu
@@ -632,15 +970,20 @@ class TLRUCache(_TimedCache):
         else:
             return cache_getitem(self, key)
 
-    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+    def __setitem__(self, key, value):
+        self._setitem(key, value)
+
+    def _setitem(self, key, value, cache_setitem=Cache._setitem):
         with self.timer as time:
             self.expire(time)
             expires = self.__ttu(key, value, time)
             if not (time < expires):
                 # updating an existing item with an already expired
                 # one should remove the existing item
-                return self.__delitem(key)
-            cache_setitem(self, key, value)
+                self.__delitem(key)
+                return True
+            if not cache_setitem(self, key, value):
+                return False
         # removing an existing item would break the heap structure, so
         # only mark it as removed for now
         try:
@@ -649,6 +992,7 @@ class TLRUCache(_TimedCache):
             pass
         self.__items[key] = item = TLRUCache._Item(key, expires)
         heapq.heappush(self.__order, item)
+        return True
 
     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
         with self.timer as time:
@@ -686,11 +1030,10 @@ class TLRUCache(_TimedCache):
             heapq.heapify(order)
         expired = []
         cache_delitem = Cache.__delitem__
-        cache_getitem = Cache.__getitem__
         while order and (order[0].removed or not (time < order[0].expires)):
             item = heapq.heappop(order)
             if not item.removed:
-                expired.append((item.key, cache_getitem(self, item.key)))
+                expired.append((item.key, self._peek(item.key)))
                 cache_delitem(self, item.key)
                 del items[item.key]
         return expired
@@ -707,7 +1050,15 @@ class TLRUCache(_TimedCache):
             except StopIteration:
                 raise KeyError("%s is empty" % type(self).__name__) from None
             else:
-                return (key, self.pop(key))
+                return (key, self._discard(key))
+
+    def _eviction_candidate(self, exclude=()):
+        with self.timer as time:
+            self.expire(time)
+            for candidate in self.__items:
+                if candidate not in exclude:
+                    return candidate
+        raise StopIteration
 
     def clear(self):
         _TimedCache.clear(self)

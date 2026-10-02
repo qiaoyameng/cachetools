@@ -6,6 +6,8 @@ import functools
 import warnings
 import weakref
 
+from ._cached import _setdefault
+
 
 def _warn_classmethod(stacklevel):
     warnings.warn(
@@ -172,7 +174,7 @@ def _condition_info(method, cache, key, lock, cond, info):
                     val = method(self._obj, *args, **kwargs)
                     with lock:
                         try:
-                            cache[key] = val
+                            _setdefault(cache, key, val)
                         except ValueError:
                             pass  # value too large
                         return val
@@ -217,7 +219,8 @@ def _locked_info(method, cache, key, lock, info):
                         # In case of a race condition, i.e. if another thread
                         # stored a value for this key while we were calling
                         # method(), prefer the cached value.
-                        return cache.setdefault(key, val)
+                        stored = _setdefault(cache, key, val)
+                        return val if stored is None or stored is False else stored
                     except ValueError:
                         return val  # value too large
 
@@ -251,7 +254,7 @@ def _unlocked_info(method, cache, key, info):
                     self.__misses += 1
                 val = method(self._obj, *args, **kwargs)
                 try:
-                    cache[key] = val
+                    _setdefault(cache, key, val)
                 except ValueError:
                     pass  # value too large
                 return val
@@ -283,7 +286,7 @@ def _condition(method, cache, key, lock, cond):
             v = method(self, *args, **kwargs)
             with lock(self):
                 try:
-                    c[k] = v
+                    _setdefault(c, k, v)
                 except ValueError:
                     pass  # value too large
                 return v
@@ -332,7 +335,8 @@ def _locked(method, cache, key, lock):
                 # In case of a race condition, i.e. if another thread
                 # stored a value for this key while we were calling
                 # method(), prefer the cached value.
-                return c.setdefault(k, v)
+                stored = _setdefault(c, k, v)
+                return v if stored is None or stored is False else stored
             except ValueError:
                 return v  # value too large
 
@@ -366,7 +370,7 @@ def _unlocked(method, cache, key):
             pass  # key not found
         v = method(self, *args, **kwargs)
         try:
-            c[k] = v
+            _setdefault(c, k, v)
         except ValueError:
             pass  # value too large
         return v

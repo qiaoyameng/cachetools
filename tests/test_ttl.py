@@ -28,6 +28,38 @@ class TTLTestCache(TTLCache):
 class TTLCacheTest(unittest.TestCase, CacheTestMixin):
     Cache = TTLTestCache
 
+    def test_admission_after_expiration(self):
+        class Policy:
+            def __init__(self):
+                self.candidates = []
+
+            def record(self, key):
+                pass
+
+            def admit(self, key, candidate):
+                self.candidates.append(candidate)
+                return False
+
+        timer = Timer()
+        policy = Policy()
+        cache = TTLCache(
+            maxsize=3,
+            ttl=1,
+            timer=timer,
+            getsizeof=len,
+            admission=policy,
+        )
+
+        cache["e"] = "x"
+        timer.tick()
+        cache["kept"] = "xxx"
+
+        cache["new"] = "yyy"
+        self.assertEqual(policy.candidates, ["kept"])
+        self.assertNotIn("e", cache)
+        self.assertIn("kept", cache)
+        self.assertNotIn("new", cache)
+
     def test_ttl(self):
         cache = TTLCache[int, int, int](maxsize=2, ttl=2, timer=Timer())
         self.assertEqual(0, cache.timer())

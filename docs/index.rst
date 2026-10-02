@@ -109,6 +109,42 @@ inserted into the cache.
    an alternative function that returns an arbitrary element from a
    non-empty sequence.
 
+Admission policies
+==================
+
+The built-in cache classes accept an optional `admission` policy.  The
+policy is consulted only when storing a *new* key requires eviction;
+updating an existing key is always allowed.  A rejected assignment
+leaves the cache unchanged.
+
+.. autoclass:: TinyLFU(capacity=128, depth=4, hasher=None, sample_size=None)
+   :members: admit, clear, frequency, record, sketch
+
+   TinyLFU estimates access frequency with a bounded
+   :class:`FrequencySketch`.  When the cache is full, the new key is
+   admitted only when its estimated frequency is strictly greater than
+   the eviction candidate's estimate.  Collisions may therefore affect
+   hit performance, but never affect key equality or returned values.
+
+   .. testcode::
+
+      from cachetools import LRUCache, TinyLFU
+
+      policy = TinyLFU(capacity=128)
+      cache = LRUCache(maxsize=4, admission=policy)
+
+.. autoclass:: FrequencySketch(width, depth=4, hasher=None, sample_size=None)
+   :members:
+      add, age, clear, depth, frequency, memory_size, sample_count,
+      sample_size, width
+
+   The sketch allocates ``width * depth`` bytes when constructed and
+   never grows with the number of observed keys.  Counters saturate at
+   15 and are halved every `sample_size` additions, which allows old
+   access frequencies to age out.  The default hashing is deterministic;
+   pass a callable returning ``(first, second)`` integers to use
+   different hash functions or to construct deterministic tests.
+
 .. autoclass:: TTLCache(maxsize, ttl, timer=time.monotonic, getsizeof=None)
    :members: popitem, timer, ttl
 

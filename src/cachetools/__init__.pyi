@@ -18,9 +18,11 @@ from typing import (
 __all__: Final = (
     "Cache",
     "FIFOCache",
+    "FrequencySketch",
     "LFUCache",
     "LRUCache",
     "RRCache",
+    "TinyLFU",
     "TLRUCache",
     "TTLCache",
     "cached",
@@ -37,9 +39,60 @@ _TT = TypeVar("_TT", default=float)
 _KT2 = TypeVar("_KT2")
 _VT2 = TypeVar("_VT2")
 
+@type_check_only
+class _AdmissionPolicy(Protocol[_KT]):
+    def record(self, key: _KT) -> None: ...
+    def admit(self, key: _KT, candidate: _KT) -> bool: ...
+
+class FrequencySketch(Generic[_KT]):
+    def __init__(
+        self,
+        width: int,
+        depth: int = 4,
+        *,
+        hasher: Callable[[_KT], tuple[int, int]] | None = None,
+        sample_size: int | None = None,
+    ) -> None: ...
+    @property
+    def width(self) -> int: ...
+    @property
+    def depth(self) -> int: ...
+    @property
+    def sample_size(self) -> int: ...
+    @property
+    def sample_count(self) -> int: ...
+    @property
+    def memory_size(self) -> int: ...
+    def add(self, key: _KT) -> None: ...
+    def frequency(self, key: _KT) -> int: ...
+    def estimate(self, key: _KT) -> int: ...
+    def age(self) -> None: ...
+    def clear(self) -> None: ...
+
+class TinyLFU(Generic[_KT]):
+    def __init__(
+        self,
+        capacity: float = 128,
+        *,
+        depth: int = 4,
+        hasher: Callable[[_KT], tuple[int, int]] | None = None,
+        sample_size: int | None = None,
+    ) -> None: ...
+    @property
+    def sketch(self) -> FrequencySketch[_KT]: ...
+    def record(self, key: _KT) -> None: ...
+    def frequency(self, key: _KT) -> int: ...
+    def estimate(self, key: _KT) -> int: ...
+    def admit(self, key: _KT, candidate: _KT) -> bool: ...
+    def clear(self) -> None: ...
+
 class Cache(MutableMapping[_KT, _VT]):
     def __init__(
-        self, maxsize: float, getsizeof: Callable[[_VT], float] | None = None
+        self,
+        maxsize: float,
+        getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        admission: _AdmissionPolicy[_KT] | None = None,
     ) -> None: ...
     def __getitem__(self, key: _KT) -> _VT: ...
     def __setitem__(self, key: _KT, value: _VT) -> None: ...
@@ -59,9 +112,32 @@ class Cache(MutableMapping[_KT, _VT]):
     @staticmethod
     def getsizeof(value: _VT) -> float: ...
 
-class FIFOCache(Cache[_KT, _VT]): ...
-class LFUCache(Cache[_KT, _VT]): ...
-class LRUCache(Cache[_KT, _VT]): ...
+class FIFOCache(Cache[_KT, _VT]):
+    def __init__(
+        self,
+        maxsize: float,
+        getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        admission: _AdmissionPolicy[_KT] | None = None,
+    ) -> None: ...
+
+class LFUCache(Cache[_KT, _VT]):
+    def __init__(
+        self,
+        maxsize: float,
+        getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        admission: _AdmissionPolicy[_KT] | None = None,
+    ) -> None: ...
+
+class LRUCache(Cache[_KT, _VT]):
+    def __init__(
+        self,
+        maxsize: float,
+        getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        admission: _AdmissionPolicy[_KT] | None = None,
+    ) -> None: ...
 
 class RRCache(Cache[_KT, _VT]):
     def __init__(
@@ -69,6 +145,8 @@ class RRCache(Cache[_KT, _VT]):
         maxsize: float,
         choice: Callable[[Sequence[_KT]], _KT] = random.choice,
         getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        admission: _AdmissionPolicy[_KT] | None = None,
     ) -> None: ...
     @property
     def choice(self) -> Callable[[Sequence[_KT]], _KT]: ...
@@ -79,6 +157,8 @@ class _TimedCache(Cache[_KT, _VT], Generic[_KT, _VT, _TT]):
         maxsize: float,
         timer: Callable[[], _TT],
         getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        admission: _AdmissionPolicy[_KT] | None = None,
     ) -> None: ...
 
     class _Timer(AbstractContextManager[_T]):
@@ -99,6 +179,7 @@ class TTLCache(_TimedCache[_KT, _VT, _TT]):
         ttl: float,
         *,
         getsizeof: Callable[[_VT2], float] | None = None,
+        admission: _AdmissionPolicy[_KT2] | None = None,
     ) -> None: ...
     @overload
     def __init__(
@@ -107,6 +188,8 @@ class TTLCache(_TimedCache[_KT, _VT, _TT]):
         ttl: Any,  # FIXME: must be "addable" to _TT
         timer: Callable[[], _TT],
         getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        admission: _AdmissionPolicy[_KT] | None = None,
     ) -> None: ...
     @property
     def ttl(self) -> Any: ...
@@ -120,6 +203,7 @@ class TLRUCache(_TimedCache[_KT, _VT, _TT]):
         ttu: Callable[[_KT2, _VT2, float], float],
         *,
         getsizeof: Callable[[_VT2], float] | None = None,
+        admission: _AdmissionPolicy[_KT2] | None = None,
     ) -> None: ...
     @overload
     def __init__(
@@ -128,6 +212,8 @@ class TLRUCache(_TimedCache[_KT, _VT, _TT]):
         ttu: Callable[[_KT, _VT, _TT], _TT],
         timer: Callable[[], _TT],
         getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        admission: _AdmissionPolicy[_KT] | None = None,
     ) -> None: ...
     @property
     def ttu(self) -> Callable[[_KT, _VT, _TT], _TT]: ...
