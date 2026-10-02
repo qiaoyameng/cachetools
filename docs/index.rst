@@ -57,7 +57,12 @@ values of a :class:`dict`.  It is the user's responsibility to take
 care that cached values are not accidentally modified.  This is
 especially important when using a custom `getsizeof` function, since
 the size of an item's value will only be computed when the item is
-inserted into the cache.
+inserted into the cache.  After modifying a cached value in place, use
+:meth:`Cache.remeasure()` to explicitly update one or more cache
+entries.  Re-measuring is atomic: all sizes are computed before the
+cache's size metadata is changed, and entries that exceed `maxsize` or
+become over capacity are removed according to the cache's eviction
+strategy.
 
 .. note::
 
@@ -67,7 +72,7 @@ inserted into the cache.
    suitable `lock` object.
 
 .. autoclass:: Cache(maxsize, getsizeof=None)
-   :members: currsize, getsizeof, maxsize
+   :members: currsize, getsizeof, maxsize, remeasure
 
    This class discards arbitrary items using :meth:`popitem` to make
    space when necessary.  Derived classes may override :meth:`popitem`
@@ -75,6 +80,10 @@ inserted into the cache.
    keep track of item access, insertion or deletion, it may
    additionally need to override :meth:`__getitem__`,
    :meth:`__setitem__` and :meth:`__delitem__`.
+
+.. autoclass:: RemeasureItem
+
+.. autoclass:: RemeasureResult
 
 .. autoclass:: FIFOCache(maxsize, getsizeof=None)
    :members: popitem

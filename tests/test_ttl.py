@@ -177,6 +177,60 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
         self.assertNotIn(2, cache)
         self.assertNotIn(3, cache)
 
+    def test_ttl_remeasure_expired(self):
+        cache = TTLCache[str, list[int], int](
+            maxsize=3, ttl=2, timer=Timer(), getsizeof=len
+        )
+        live = [0]
+        expired = [0]
+        cache["expired"] = expired
+        cache.timer.tick()
+        cache["live"] = live
+        cache.timer.tick()
+        live.append(0)
+
+        result = cache.remeasure("live", "expired", "missing")
+
+        self.assertEqual(2, cache.currsize)
+        self.assertEqual({"live"}, set(cache))
+        self.assertEqual(("updated", 1, 2), result["live"])
+        self.assertEqual(("expired", 1, None), result["expired"])
+        self.assertEqual(("missing", None, None), result["missing"])
+        self.assertEqual([("expired", expired)], result.expired)
+
+    def test_ttl_remeasure_failure_does_not_expire(self):
+        cache = TTLCache[str, list[int], int](
+            maxsize=4, ttl=2, timer=Timer(), getsizeof=len
+        )
+        expired = [0]
+        failing = [0]
+        keep = [0]
+        cache["expired"] = expired
+        cache.timer.tick()
+        cache["failing"] = failing
+        cache["keep"] = keep
+        cache.timer.tick()
+        failing.append(0)
+
+        def getsizeof(value):
+            if value is failing:
+                raise RuntimeError("cannot measure")
+            return len(value)
+
+        cache.getsizeof = getsizeof
+
+        with self.assertRaisesRegex(RuntimeError, "cannot measure"):
+            cache.remeasure("failing")
+
+        self.assertEqual([("expired", expired)], cache.expire())
+        self.assertEqual(2, cache.currsize)
+
+        cache.getsizeof = len
+        result = cache.remeasure("failing")
+
+        self.assertEqual(3, cache.currsize)
+        self.assertEqual(("updated", 1, 2), result["failing"])
+
     def test_ttl_atomic(self):
         cache = TTLCache[int, int, int](maxsize=1, ttl=2, timer=Timer(auto=True))
         cache[1] = 1

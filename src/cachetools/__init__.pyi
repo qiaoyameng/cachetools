@@ -20,6 +20,8 @@ __all__: Final = (
     "FIFOCache",
     "LFUCache",
     "LRUCache",
+    "RemeasureItem",
+    "RemeasureResult",
     "RRCache",
     "TLRUCache",
     "TTLCache",
@@ -37,6 +39,19 @@ _TT = TypeVar("_TT", default=float)
 _KT2 = TypeVar("_KT2")
 _VT2 = TypeVar("_VT2")
 
+class RemeasureItem(NamedTuple):
+    status: Literal["updated", "evicted", "too_large", "missing", "expired"]
+    oldsize: float | None
+    newsize: float | None
+
+class RemeasureResult(dict[_KT, RemeasureItem], Generic[_KT, _VT]):
+    @property
+    def currsize(self) -> float: ...
+    @property
+    def duplicates(self) -> list[_KT]: ...
+    evicted: list[tuple[_KT, _VT]]
+    expired: list[tuple[_KT, _VT]]
+
 class Cache(MutableMapping[_KT, _VT]):
     def __init__(
         self, maxsize: float, getsizeof: Callable[[_VT], float] | None = None
@@ -52,6 +67,7 @@ class Cache(MutableMapping[_KT, _VT]):
     @overload
     def pop(self, key: _KT, default: _VT | _T) -> _VT | _T: ...
     def setdefault(self, key: _KT, default: _VT | None = None) -> _VT: ...
+    def remeasure(self, *keys: _KT) -> RemeasureResult[_KT, _VT]: ...
     @property
     def maxsize(self) -> float: ...
     @property

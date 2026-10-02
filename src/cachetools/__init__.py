@@ -5,6 +5,8 @@ __all__ = (
     "FIFOCache",
     "LFUCache",
     "LRUCache",
+    "RemeasureItem",
+    "RemeasureResult",
     "RRCache",
     "TLRUCache",
     "TTLCache",
@@ -16,12 +18,46 @@ __version__ = "7.2.0"
 
 import collections
 import collections.abc
+import contextlib
 import functools
 import heapq
 import random
 import time
 
 from . import keys
+
+
+RemeasureItem = collections.namedtuple(
+    "RemeasureItem", ["status", "oldsize", "newsize"]
+)
+
+
+class RemeasureResult(dict):
+    """Result of a call to :meth:`Cache.remeasure`."""
+
+    __slots__ = ("currsize", "duplicates", "evicted", "expired")
+
+    def __init__(
+        self, results=(), evicted=(), expired=(), duplicates=(), currsize=0
+    ):
+        super().__init__(results)
+        self.evicted = list(evicted)
+        self.expired = list(expired)
+        self.duplicates = list(duplicates)
+        self.currsize = currsize
+
+    def __repr__(self):
+        return (
+            "RemeasureResult(%r, evicted=%r, expired=%r, duplicates=%r, "
+            "currsize=%r)"
+            % (
+                dict(self),
+                self.evicted,
+                self.expired,
+                self.duplicates,
+                self.currsize,
+            )
+        )
 
 
 class _DefaultSize:
@@ -151,6 +187,122 @@ class Cache(collections.abc.MutableMapping):
         self.__data.clear()
         self.__size.clear()
         self.__currsize = 0
+
+    def remeasure(self, *keys):
+        """Recompute the size of one or more existing cache entries."""
+        if not keys:
+            return RemeasureResult(currsize=self.__currsize)
+
+        seen = set()
+        unique_keys = []
+        duplicates = []
+        for key in keys:
+            if key in seen:
+                duplicates.append(key)
+            else:
+                seen.add(key)
+                unique_keys.append(key)
+
+        items = {}
+        live_keys = []
+        old_sizes = {}
+        new_sizes = {}
+
+        with self._remeasure_context():
+            for key in unique_keys:
+                if not self._remeasure_has_key(key):
+                    items[key] = RemeasureItem("missing", None, None)
+                elif self._remeasure_is_expired(key):
+                    items[key] = RemeasureItem("expired", self.__size[key], None)
+                else:
+                    old_sizes[key] = self.__size[key]
+                    live_keys.append(key)
+
+            errors = []
+            for key in live_keys:
+                try:
+                    new_size = self.getsizeof(self.__data[key])
+                    if new_size < 0:
+                        raise ValueError("value size must be non-negative")
+                except Exception as error:
+                    errors.append(error)
+                else:
+                    new_sizes[key] = new_size
+
+            if errors:
+                raise errors[0]
+
+            expired = self._remeasure_expire()
+            expired_keys = {key for key, _value in expired}
+
+            too_large = []
+            sized_keys = []
+            for key in live_keys:
+                if key in expired_keys:
+                    items[key] = RemeasureItem(
+                        "expired", old_sizes[key], None
+                    )
+                elif new_sizes[key] > self.__maxsize:
+                    too_large.append(key)
+                else:
+                    sized_keys.append(key)
+
+            for key in too_large:
+                del self[key]
+
+            diffsize = 0
+            for key in sized_keys:
+                newsize = new_sizes[key]
+                diffsize += newsize - old_sizes[key]
+                self.__size[key] = newsize
+            self.__currsize += diffsize
+
+            target_keys = set(sized_keys) | set(too_large)
+            evicted = []
+            evicted_sizes = {}
+            evicted_target_keys = set()
+            while self.__currsize > self.__maxsize:
+                key, value = self.popitem()
+                evicted.append((key, value))
+                if key in target_keys:
+                    evicted_target_keys.add(key)
+                evicted_sizes[key] = old_sizes.get(key)
+
+            for key in too_large:
+                items[key] = RemeasureItem(
+                    "too_large", old_sizes[key], new_sizes[key]
+                )
+
+            for key in sized_keys:
+                if key in evicted_target_keys:
+                    status = "evicted"
+                    oldsize = evicted_sizes[key]
+                else:
+                    status = "updated"
+                    oldsize = old_sizes[key]
+                items[key] = RemeasureItem(
+                    status, oldsize, new_sizes[key]
+                )
+
+        return RemeasureResult(
+            items,
+            evicted=evicted,
+            expired=expired,
+            duplicates=duplicates,
+            currsize=self.__currsize,
+        )
+
+    def _remeasure_context(self):
+        return contextlib.nullcontext()
+
+    def _remeasure_has_key(self, key):
+        return key in self.__data
+
+    def _remeasure_is_expired(self, key):
+        return False
+
+    def _remeasure_expire(self):
+        return []
 
     @property
     def maxsize(self):
@@ -446,6 +598,15 @@ class _TimedCache(Cache):
 
     def expire(self, time=None):  # pragma: no cover
         raise NotImplementedError
+
+    def _remeasure_context(self):
+        return self.timer
+
+    def _remeasure_is_expired(self, key):
+        return self._remeasure_has_key(key) and key not in self
+
+    def _remeasure_expire(self):
+        return self.expire()
 
 
 class TTLCache(_TimedCache):

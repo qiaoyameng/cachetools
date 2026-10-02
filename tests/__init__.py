@@ -366,6 +366,99 @@ class CacheTestMixin(_TestCaseProtocol):
 
         self._test_getsizeof(Cache(maxsize=3))
 
+    def test_remeasure_grow_and_shrink(self):
+        cache = self.Cache(maxsize=5, getsizeof=len)
+        growing = [0]
+        shrinking = [0, 0]
+        cache["growing"] = growing
+        cache["shrinking"] = shrinking
+        cache["keep"] = [0, 0]
+
+        growing.append(0)
+        shrinking.pop()
+
+        result = cache.remeasure("growing", "shrinking")
+
+        self.assertEqual(5, cache.currsize)
+        self.assertEqual({"growing", "shrinking", "keep"}, set(cache))
+        self.assertEqual(
+            ("updated", 1, 2), result["growing"]
+        )
+        self.assertEqual(
+            ("updated", 2, 1), result["shrinking"]
+        )
+        self.assertEqual([], result.evicted)
+        self.assertEqual(5, result.currsize)
+
+    def test_remeasure_failure_is_atomic(self):
+        cache = self.Cache(maxsize=6, getsizeof=len)
+        growing = [0]
+        shrinking = [0, 0]
+        failing = [0, 0]
+        cache["growing"] = growing
+        cache["shrinking"] = shrinking
+        cache["failing"] = failing
+
+        growing.append(0)
+        growing.append(0)
+        shrinking.pop()
+
+        def getsizeof(value):
+            if value is failing:
+                raise RuntimeError("cannot measure")
+            return len(value)
+
+        cache.getsizeof = getsizeof
+
+        with self.assertRaisesRegex(RuntimeError, "cannot measure"):
+            cache.remeasure("growing", "shrinking", "failing")
+
+        self.assertEqual(5, cache.currsize)
+        self.assertEqual({"growing", "shrinking", "failing"}, set(cache))
+
+        cache.getsizeof = len
+        result = cache.remeasure("growing", "shrinking", "failing")
+
+        self.assertEqual(6, cache.currsize)
+        self.assertEqual(
+            ("updated", 1, 3), result["growing"]
+        )
+        self.assertEqual(
+            ("updated", 2, 1), result["shrinking"]
+        )
+        self.assertEqual(
+            ("updated", 2, 2), result["failing"]
+        )
+
+    def test_remeasure_missing_duplicate_and_too_large(self):
+        cache = self.Cache(maxsize=5, getsizeof=len)
+        value = [0]
+        oversized = [0, 0]
+        cache["value"] = value
+        cache["oversized"] = oversized
+
+        value.append(0)
+        oversized.extend([0, 0, 0, 0, 0])
+
+        result = cache.remeasure("value", "missing", "value", "oversized")
+
+        self.assertEqual(2, cache.currsize)
+        self.assertEqual({"value"}, set(cache))
+        self.assertEqual(("updated", 1, 2), result["value"])
+        self.assertEqual(("missing", None, None), result["missing"])
+        self.assertEqual(("too_large", 2, 7), result["oversized"])
+        self.assertEqual(["value"], result.duplicates)
+
+    def test_remeasure_empty(self):
+        cache = self.Cache(maxsize=2, getsizeof=len)
+        cache["value"] = [0]
+
+        result = cache.remeasure()
+
+        self.assertEqual({}, dict(result))
+        self.assertEqual([], result.duplicates)
+        self.assertEqual(1, result.currsize)
+
     def test_clear(self):
         cache = self.Cache(maxsize=2)
         cache.update({1: 1, 2: 2})
