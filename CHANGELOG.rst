@@ -1,3 +1,10 @@
+v7.3.0 (unreleased)
+===================
+
+- Add composable ``TinyLFUCache`` admission policy with bounded,
+  aging frequency counters.
+
+
 v7.2.0 (2026-09-16)
 ===================
 

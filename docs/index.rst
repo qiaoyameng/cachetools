@@ -21,7 +21,14 @@ method calls.
 
 .. testsetup:: *
 
-   from cachetools import cached, cachedmethod, LRUCache, TLRUCache, TTLCache
+   from cachetools import (
+       cached,
+       cachedmethod,
+       LRUCache,
+       TinyLFUCache,
+       TLRUCache,
+       TTLCache,
+   )
 
    from unittest import mock
    urllib = mock.MagicMock()
@@ -108,6 +115,40 @@ inserted into the cache.
    :func:`random.choice`.  The optional argument `choice` may specify
    an alternative function that returns an arbitrary element from a
    non-empty sequence.
+
+.. autoclass:: TinyLFUCache(cache, capacity=1024, sample_size=None, hashfunc=hash)
+   :members: cache, capacity, counter_size, frequency, sample_size
+
+   This class wraps another mutable mapping with a TinyLFU admission
+   policy.  Reads update a bounded Count-Min sketch, and a new key is
+   stored only when its estimated access frequency is greater than
+   that of every item that would have to be removed to make room.
+   Ties retain the existing candidates, so keys accessed only once do
+   not usually replace cache entries.
+
+   The sketch uses four rows with `capacity` four-bit counters each,
+   so its memory usage remains constant regardless of the number of
+   keys seen.  After every `sample_size` accesses, all counters are
+   halved.  By default, `sample_size` is ten times the wrapped cache's
+   :attr:`Cache.maxsize` (or 10240 for a cache without a finite
+   maximum size).
+
+   The optional `hashfunc` must map a key to an integer.  Hash
+   collisions affect only admission estimates; keys and values remain
+   in the wrapped cache, which performs all actual key lookups.
+   Passing a deterministic hash function is useful for reproducible
+   tests.
+
+   Updating an existing key always bypasses admission.  As with other
+   mutable mappings, inserting a value whose reported size exceeds the
+   wrapped cache's maximum raises :class:`ValueError`.  When a new key
+   is denied admission, the assignment itself is ignored; when used
+   with :func:`cached`, the decorated function still returns the value
+   it computed.
+
+   .. testcode::
+
+      cache = TinyLFUCache(LRUCache(maxsize=128))
 
 .. autoclass:: TTLCache(maxsize, ttl, timer=time.monotonic, getsizeof=None)
    :members: popitem, timer, ttl

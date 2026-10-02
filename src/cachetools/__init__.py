@@ -6,6 +6,7 @@ __all__ = (
     "LFUCache",
     "LRUCache",
     "RRCache",
+    "TinyLFUCache",
     "TLRUCache",
     "TTLCache",
     "cached",
@@ -18,6 +19,7 @@ import collections
 import collections.abc
 import functools
 import heapq
+import math
 import random
 import time
 
@@ -134,6 +136,17 @@ class Cache(collections.abc.MutableMapping):
             value = default
         return value
 
+    def _peekitems(self, count, excluded=()):
+        """Return up to count eviction candidates without removing them."""
+        result = []
+        for key in self:
+            if key in excluded:
+                continue
+            if len(result) >= count:
+                break
+            result.append((key, Cache.__getitem__(self, key)))
+        return result
+
     def setdefault(self, key, default=None):
         if key in self:
             value = self[key]
@@ -194,6 +207,14 @@ class FIFOCache(Cache):
             raise KeyError("%s is empty" % type(self).__name__) from None
         else:
             return (key, self.pop(key))
+
+    def _peekitems(self, count, excluded=()):
+        """Return eviction candidates without removing them."""
+        return [
+            (key, Cache.__getitem__(self, key))
+            for index, (key, _) in enumerate(self.__order.items())
+            if index < count and key not in excluded
+        ]
 
     def clear(self):
         Cache.clear(self)
@@ -259,6 +280,20 @@ class LFUCache(Cache):
         key = next(iter(curr.keys))  # remove an arbitrary element
         return (key, self.pop(key))
 
+    def _peekitems(self, count, excluded=()):
+        """Return eviction candidates without updating use counts."""
+        result = []
+        curr = self.__root.next
+        while curr is not self.__root and len(result) < count:
+            for key in curr.keys:
+                if key in excluded:
+                    continue
+                result.append((key, Cache.__getitem__(self, key)))
+                if len(result) == count:
+                    return result
+            curr = curr.next
+        return result
+
     def clear(self):
         Cache.clear(self)
         root = self.__root
@@ -314,6 +349,14 @@ class LRUCache(Cache):
         else:
             return (key, self.pop(key))
 
+    def _peekitems(self, count, excluded=()):
+        """Return eviction candidates without marking them as used."""
+        return [
+            (key, Cache.__getitem__(self, key))
+            for index, (key, _) in enumerate(self.__order.items())
+            if index < count and key not in excluded
+        ]
+
     def clear(self):
         Cache.clear(self)
         self.__order.clear()
@@ -364,10 +407,251 @@ class RRCache(Cache):
         else:
             return (key, self.pop(key))
 
+    def _peekitems(self, count, excluded=()):
+        """Return random eviction candidates without removing them."""
+        keys = [key for key in self.__keys if key not in excluded]
+        result = []
+        while keys and len(result) < count:
+            key = self.__choice(keys)
+            keys.remove(key)
+            result.append((key, Cache.__getitem__(self, key)))
+        return result
+
     def clear(self):
         Cache.clear(self)
         self.__index.clear()
         del self.__keys[:]
+
+
+class _CountMinSketch:
+    """Bounded frequency sketch with periodic counter aging."""
+
+    __slots__ = ("capacity", "counters", "hashfunc", "sample_size", "seen")
+
+    def __init__(self, capacity, sample_size, hashfunc):
+        self.capacity = capacity
+        row_size = (capacity + 1) // 2
+        self.counters = bytearray(4 * row_size)
+        self.sample_size = sample_size
+        self.hashfunc = hashfunc
+        self.seen = 0
+
+    @staticmethod
+    def _mix(value):
+        value = (value + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        value = (
+            (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9
+        ) & 0xFFFFFFFFFFFFFFFF
+        value = (
+            (value ^ (value >> 27)) * 0x94D049BB133111EB
+        ) & 0xFFFFFFFFFFFFFFFF
+        return value ^ (value >> 31)
+
+    def _indexes(self, key):
+        value = self.hashfunc(key) & 0xFFFFFFFFFFFFFFFF
+        first = self._mix(value) % self.capacity
+        second = self._mix(value ^ 0xFFFFFFFFFFFFFFFF) % self.capacity
+        positions = (
+            first,
+            (first + second) % self.capacity,
+            (first + 2 * second) % self.capacity,
+            (first + 3 * second) % self.capacity,
+        )
+        row_size = (self.capacity + 1) // 2
+        return tuple(
+            row * row_size + position // 2
+            for row, position in enumerate(positions)
+        )
+
+    def _get(self, index):
+        pair = self.counters[index // 2]
+        if index % 2:
+            return pair >> 4
+        return pair & 0x0F
+
+    def _increment(self, index):
+        pair_index = index // 2
+        pair = self.counters[pair_index]
+        if index % 2:
+            value = pair >> 4
+            if value < 15:
+                self.counters[pair_index] = (pair & 0x0F) | ((value + 1) << 4)
+        else:
+            value = pair & 0x0F
+            if value < 15:
+                self.counters[pair_index] = (pair & 0xF0) | (value + 1)
+
+    def _age(self):
+        counters = self.counters
+        for index, pair in enumerate(counters):
+            counters[index] = ((pair & 0x0F) >> 1) | (((pair >> 4) >> 1) << 4)
+
+    def frequency(self, key):
+        return min(self._get(index) for index in self._indexes(key))
+
+    def add(self, key):
+        indexes = self._indexes(key)
+        for index in indexes:
+            self._increment(index)
+        self.seen += 1
+        if self.seen >= self.sample_size:
+            self._age()
+            self.seen = 0
+
+    def clear(self):
+        self.counters = bytearray(len(self.counters))
+        self.seen = 0
+
+
+class TinyLFUCache(Cache):
+    """Cache wrapper admitting replacements with a TinyLFU frequency sketch."""
+
+    def __init__(
+        self, cache, capacity=1024, sample_size=None, hashfunc=hash
+    ):
+        if not isinstance(cache, collections.abc.MutableMapping):
+            raise TypeError("cache must be a mutable mapping")
+        if not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("capacity must be a positive integer")
+
+        maxsize = getattr(cache, "maxsize", math.inf)
+        if sample_size is None:
+            sample_size = (
+                max(1, int(maxsize * 10))
+                if math.isfinite(maxsize)
+                else 10240
+            )
+        if not isinstance(sample_size, int) or sample_size <= 0:
+            raise ValueError("sample_size must be a positive integer")
+        if not isinstance(hashfunc("probe"), int):
+            raise TypeError("hashfunc must return an integer")
+
+        Cache.__init__(self, math.inf)
+        self.__cache = cache
+        self.__sketch = _CountMinSketch(capacity, sample_size, hashfunc)
+        self.__candidate_keys = set()
+
+    @property
+    def cache(self):
+        """The wrapped cache used for key and value storage."""
+        return self.__cache
+
+    @property
+    def capacity(self):
+        """Number of counter slots in each sketch row."""
+        return self.__sketch.capacity
+
+    @property
+    def sample_size(self):
+        """Number of recorded accesses between sketch aging cycles."""
+        return self.__sketch.sample_size
+
+    @property
+    def counter_size(self):
+        """Number of bytes used by frequency counters."""
+        return len(self.__sketch.counters)
+
+    def frequency(self, key):
+        """Return the estimated access frequency for a key."""
+        return self.__sketch.frequency(key)
+
+    def __getitem__(self, key):
+        self.__sketch.add(key)
+        return self.__cache[key]
+
+    def __setitem__(self, key, value):
+        if key in self.__cache:
+            self.__cache[key] = value
+            return
+
+        size = self._getsizeof(value)
+        if size < 0:
+            raise ValueError("value size must be non-negative")
+        if size > self.maxsize:
+            raise ValueError("value too large")
+
+        if not self._has_room(key, size):
+            return
+        self.__cache[key] = value
+
+    def __delitem__(self, key):
+        del self.__cache[key]
+
+    def __contains__(self, key):
+        return key in self.__cache
+
+    def __iter__(self):
+        return iter(self.__cache)
+
+    def __len__(self):
+        return len(self.__cache)
+
+    def __repr__(self):
+        return "%s(%r)" % (type(self).__name__, self.__cache)
+
+    @property
+    def maxsize(self):
+        return getattr(self.__cache, "maxsize", math.inf)
+
+    @property
+    def currsize(self):
+        return getattr(self.__cache, "currsize", len(self.__cache))
+
+    def getsizeof(self, value):
+        getsizeof = getattr(self.__cache, "getsizeof", Cache.getsizeof)
+        return getsizeof(value)
+
+    def _getsizeof(self, value):
+        return self.getsizeof(value)
+
+    def _candidate(self):
+        excluded = self.__candidate_keys
+        peek = getattr(self.__cache, "_peekitems", None)
+        if peek is not None:
+            return peek(1, excluded)
+
+        result = []
+        for key in self.__cache:
+            if key in excluded:
+                continue
+            result.append((key, self.__cache[key]))
+            if len(result) == 1:
+                break
+
+        return result
+
+    def _has_room(self, key, incoming_size):
+        cache = self.__cache
+        sketch = self.__sketch
+        maxsize = self.maxsize
+        candidate_keys = self.__candidate_keys
+        candidate_keys.clear()
+        remaining_size = self.currsize + incoming_size
+
+        while remaining_size > maxsize:
+            candidates = self._candidate()
+            if not candidates:
+                return False
+            candidate_key, candidate_value = candidates[0]
+            if sketch.frequency(candidate_key) >= sketch.frequency(key):
+                return False
+            candidate_keys.add(candidate_key)
+            remaining_size -= cache.getsizeof(candidate_value)
+
+        for candidate_key in candidate_keys:
+            del cache[candidate_key]
+        candidate_keys.clear()
+        return True
+
+    def popitem(self):
+        return self.__cache.popitem()
+
+    def _peekitems(self, count, excluded=()):
+        return self.__cache._peekitems(count, excluded)
+
+    def clear(self):
+        self.__cache.clear()
+        self.__sketch.clear()
 
 
 class _TimedCache(Cache):
@@ -577,6 +861,16 @@ class TTLCache(_TimedCache):
             else:
                 return (key, self.pop(key))
 
+    def _peekitems(self, count, excluded=()):
+        """Return valid eviction candidates without reordering them."""
+        with self.timer as time:
+            self.expire(time)
+            return [
+                (key, Cache.__getitem__(self, key))
+                for index, key in enumerate(self.__links)
+                if index < count and key not in excluded
+            ]
+
     def clear(self):
         _TimedCache.clear(self)
         root = self.__root
@@ -708,6 +1002,16 @@ class TLRUCache(_TimedCache):
                 raise KeyError("%s is empty" % type(self).__name__) from None
             else:
                 return (key, self.pop(key))
+
+    def _peekitems(self, count, excluded=()):
+        """Return valid eviction candidates without reordering them."""
+        with self.timer as time:
+            self.expire(time)
+            return [
+                (key, Cache.__getitem__(self, key))
+                for index, key in enumerate(self.__items)
+                if index < count and key not in excluded
+            ]
 
     def clear(self):
         _TimedCache.clear(self)

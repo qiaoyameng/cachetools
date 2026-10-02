@@ -21,6 +21,7 @@ __all__: Final = (
     "LFUCache",
     "LRUCache",
     "RRCache",
+    "TinyLFUCache",
     "TLRUCache",
     "TTLCache",
     "cached",
@@ -72,6 +73,29 @@ class RRCache(Cache[_KT, _VT]):
     ) -> None: ...
     @property
     def choice(self) -> Callable[[Sequence[_KT]], _KT]: ...
+
+class TinyLFUCache(Cache[_KT, _VT]):
+    def __init__(
+        self,
+        cache: MutableMapping[_KT, _VT],
+        capacity: int = 1024,
+        sample_size: int | None = None,
+        hashfunc: Callable[[Any], int] = hash,
+    ) -> None: ...
+    @property
+    def cache(self) -> MutableMapping[_KT, _VT]: ...
+    @property
+    def capacity(self) -> int: ...
+    @property
+    def sample_size(self) -> int: ...
+    @property
+    def counter_size(self) -> int: ...
+    def frequency(self, key: _KT) -> int: ...
+    def getsizeof(self, value: _VT) -> float: ...
+    @property
+    def maxsize(self) -> float: ...
+    @property
+    def currsize(self) -> float: ...
 
 class _TimedCache(Cache[_KT, _VT], Generic[_KT, _VT, _TT]):
     def __init__(
