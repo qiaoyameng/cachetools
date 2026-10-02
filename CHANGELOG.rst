@@ -1,3 +1,12 @@
+Unreleased
+==========
+
+- Add an optional ``budget`` argument to ``TTLCache.expire`` and
+  ``TLRUCache.expire`` to bound the work of a single expiration pass.
+  The returned list additionally reports the work done (``checked``)
+  and whether more expired entries remain (``remaining``).  For
+  ``TLRUCache``, stale heap nodes are charged against the budget.
+
 v7.2.0 (2026-09-16)
 ===================
 

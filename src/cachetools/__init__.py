@@ -370,6 +370,28 @@ class RRCache(Cache):
         del self.__keys[:]
 
 
+class _ExpireResult(list):
+    """The list of ``(key, value)`` pairs removed by an ``expire()`` call.
+
+    Besides the removed pairs (which behaves exactly like the plain list
+    returned by earlier versions), a result also reports:
+
+    * ``checked``: the amount of work done by the call -- removed
+      expiration entries for :class:`TTLCache`, popped heap nodes
+      (including stale ones) for :class:`TLRUCache`, and
+    * ``remaining``: :const:`True` if the work budget was exhausted while
+      expired (or stale) entries were still pending at the heap/link
+      head, so another call may remove more items.
+    """
+
+    __slots__ = ("checked", "remaining")
+
+    def __init__(self):
+        list.__init__(self)
+        self.checked = 0
+        self.remaining = False
+
+
 class _TimedCache(Cache):
     """Base class for time aware cache implementations."""
 
@@ -444,7 +466,7 @@ class _TimedCache(Cache):
         # be O(1) regardless of cache contents.
         Cache.clear(self)
 
-    def expire(self, time=None):  # pragma: no cover
+    def expire(self, time=None, budget=None):  # pragma: no cover
         raise NotImplementedError
 
 
@@ -541,26 +563,54 @@ class TTLCache(_TimedCache):
         """The time-to-live value of the cache's items."""
         return self.__ttl
 
-    def expire(self, time=None):
-        """Remove expired items from the cache and return an iterable of the
-        expired `(key, value)` pairs.
+    def expire(self, time=None, budget=None):
+        """Remove expired items from the cache.
+
+        If `budget` is :const:`None`, all expired items are removed.
+        Otherwise, `budget` limits the amount of work done by this call:
+        at most `budget` expired entries (ordered by expiration time) are
+        removed, each counting as one unit of work.  Peeking at the
+        still-valid head entry is O(1), free, and ends the scan, so a
+        call never removes a live item.
+
+        The returned list of expired `(key, value)` pairs additionally
+        exposes `checked` (the number of entries removed by this call)
+        and `remaining` (whether more expired entries may be pending
+        because the budget was exhausted).
 
         """
         if time is None:
             time = self.timer()
+        if budget is None:
+            bounded = False
+            budget = -1
+        else:
+            if budget < 0:
+                raise ValueError("budget must be non-negative")
+            bounded = True
         root = self.__root
         curr = root.next
         links = self.__links
-        expired = []
+        expired = _ExpireResult()
         cache_delitem = Cache.__delitem__
         cache_getitem = Cache.__getitem__
-        while curr is not root and not (time < curr.expires):
+        checked = 0
+        while curr is not root:
+            if bounded and checked >= budget:
+                expired.remaining = True
+                break
+            if time < curr.expires:
+                # the links are ordered by expiration time, so with a
+                # monotonic timer nothing expired follows a live head
+                break
+            checked += 1
             expired.append((curr.key, cache_getitem(self, curr.key)))
             cache_delitem(self, curr.key)
             del links[curr.key]
             next = curr.next
             curr.unlink()
             curr = next
+        expired.checked = checked
         return expired
 
     def popitem(self):
@@ -671,28 +721,59 @@ class TLRUCache(_TimedCache):
         """The local time-to-use function used by the cache."""
         return self.__ttu
 
-    def expire(self, time=None):
-        """Remove expired items from the cache and return an iterable of the
-        expired `(key, value)` pairs.
+    def expire(self, time=None, budget=None):
+        """Remove expired items from the cache.
+
+        If `budget` is :const:`None`, all expired items are removed.
+        Otherwise, `budget` limits the amount of work done by this call:
+        at most `budget` heap nodes are popped.  Stale heap nodes left
+        behind by replaced or explicitly deleted items *do* count
+        against the budget (they are the work that would otherwise pile
+        up as a large one-time cleanup), while peeking at the still-valid
+        heap root is O(1), does not count and ends the scan.
+
+        The returned list of expired `(key, value)` pairs additionally
+        exposes `checked` (the number of heap nodes popped) and
+        `remaining` (whether more expired or stale nodes may be pending
+        because the budget was exhausted).
 
         """
         if time is None:
             time = self.timer()
+        if budget is None:
+            bounded = False
+            budget = -1
+        else:
+            if budget < 0:
+                raise ValueError("budget must be non-negative")
+            bounded = True
         items = self.__items
         order = self.__order
-        # clean up the heap if too many items are marked as removed
-        if len(order) > len(items) * self.__HEAP_CLEANUP_FACTOR:
+        # When bounded, stale heap nodes are popped lazily and charged to
+        # the budget, so a call never does more than `budget` heap
+        # operations.  An unbounded call additionally compacts a bloated
+        # heap in one pass.
+        if not bounded and (
+            len(order) > len(items) * self.__HEAP_CLEANUP_FACTOR
+        ):
             self.__order = order = [item for item in order if not item.removed]
             heapq.heapify(order)
-        expired = []
+        expired = _ExpireResult()
         cache_delitem = Cache.__delitem__
         cache_getitem = Cache.__getitem__
+        checked = 0
         while order and (order[0].removed or not (time < order[0].expires)):
+            if bounded and checked >= budget:
+                expired.remaining = True
+                break
             item = heapq.heappop(order)
+            if bounded:
+                checked += 1
             if not item.removed:
                 expired.append((item.key, cache_getitem(self, item.key)))
                 cache_delitem(self, item.key)
                 del items[item.key]
+        expired.checked = checked
         return expired
 
     def popitem(self):

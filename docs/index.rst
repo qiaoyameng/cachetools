@@ -138,7 +138,7 @@ inserted into the cache.
 
       cache = TTLCache(maxsize=10, ttl=timedelta(hours=12), timer=datetime.now)
 
-   .. method:: expire(self, time=None)
+   .. method:: expire(self, time=None, budget=None)
 
       Expired items will be removed from a cache only at the next
       mutating operation, e.g. :meth:`__setitem__` or
@@ -149,7 +149,19 @@ inserted into the cache.
       items that have expired by the current value returned by
       :attr:`timer`.
 
-      :returns: An iterable of expired `(key, value)` pairs.
+      If `budget` is not :const:`None`, it caps the work of a single
+      call: at most `budget` expired entries are removed, which bounds
+      the latency of the call even when many items expire at the same
+      time.  Each removed entry costs one unit; peeking at the
+      still-valid head entry is free and ends the call, so a live item
+      is never removed.  Expired items not yet removed remain
+      inaccessible but logically expired, and are removed by subsequent
+      calls.  The returned list exposes the number of removed entries as
+      its `checked` attribute and whether more expired entries may remain
+      as its `remaining` attribute.
+
+      :returns: A list of expired `(key, value)` pairs, annotated with
+         `checked` and `remaining` attributes.
 
 .. autoclass:: TLRUCache(maxsize, ttu, timer=time.monotonic, getsizeof=None)
    :members: popitem, timer, ttu
@@ -191,7 +203,7 @@ inserted into the cache.
    expired items are there to remove, the least recently used items
    will be discarded first to make space when necessary.
 
-   .. method:: expire(self, time=None)
+   .. method:: expire(self, time=None, budget=None)
 
       Expired items will be removed from a cache only at the next
       mutating operation, e.g. :meth:`__setitem__` or
@@ -202,7 +214,20 @@ inserted into the cache.
       items that have expired by the current value returned by
       :attr:`timer`.
 
-      :returns: An iterable of expired `(key, value)` pairs.
+      If `budget` is not :const:`None`, it caps the work of a single
+      call: at most `budget` heap nodes are popped, which bounds the
+      latency of the call even when many items expire at the same
+      time.  Stale heap nodes left behind by replaced or deleted items
+      count against the budget, as does removing an expired item;
+      peeking at the still-valid heap root is free and ends the call.
+      Expired items not yet removed remain inaccessible but logically
+      expired, and are removed by subsequent calls.  The returned list
+      exposes the number of popped heap nodes as its `checked`
+      attribute and whether more expired or stale nodes may remain as
+      its `remaining` attribute.
+
+      :returns: A list of expired `(key, value)` pairs, annotated with
+         `checked` and `remaining` attributes.
 
 
 Extending cache classes
