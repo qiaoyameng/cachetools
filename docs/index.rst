@@ -92,6 +92,14 @@ inserted into the cache.
    This class counts how often an item is retrieved, and discards the
    items used least often to make space when necessary.
 
+.. autoclass:: DecayingLFUCache(maxsize, getsizeof=None, decay_period=1000, clock=None)
+   :members: popitem
+
+   This class counts how often an item is retrieved, and discards the
+   items used least often to make space when necessary.  Counts are
+   periodically halved, so items that are no longer accessed eventually
+   lose their protection against eviction.
+
 .. autoclass:: LRUCache(maxsize, getsizeof=None)
    :members: popitem
 

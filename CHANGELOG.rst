@@ -1,3 +1,10 @@
+Unreleased
+==========
+
+- Add ``DecayingLFUCache``, an LFU cache implementation with periodic
+  frequency decay, configurable by access count or an injected clock.
+
+
 v7.2.0 (2026-09-16)
 ===================
 

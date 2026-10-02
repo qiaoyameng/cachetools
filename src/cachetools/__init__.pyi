@@ -17,6 +17,7 @@ from typing import (
 
 __all__: Final = (
     "Cache",
+    "DecayingLFUCache",
     "FIFOCache",
     "LFUCache",
     "LRUCache",
@@ -61,6 +62,16 @@ class Cache(MutableMapping[_KT, _VT]):
 
 class FIFOCache(Cache[_KT, _VT]): ...
 class LFUCache(Cache[_KT, _VT]): ...
+
+class DecayingLFUCache(Cache[_KT, _VT]):
+    def __init__(
+        self,
+        maxsize: float,
+        getsizeof: Callable[[_VT], float] | None = None,
+        decay_period: float = 1000,
+        clock: Callable[[], float] | None = None,
+    ) -> None: ...
+
 class LRUCache(Cache[_KT, _VT]): ...
 
 class RRCache(Cache[_KT, _VT]):

@@ -2,6 +2,7 @@
 
 __all__ = (
     "Cache",
+    "DecayingLFUCache",
     "FIFOCache",
     "LFUCache",
     "LRUCache",
@@ -279,6 +280,153 @@ class LFUCache(Cache):
             curr.prev = link
         curr.keys.add(key)
         link.keys.remove(key)
+        if not link.keys:
+            link.unlink()
+        self.__links[key] = curr
+
+
+class DecayingLFUCache(Cache):
+    """Least Frequently Used (LFU) cache implementation with frequency decay.
+
+    Use counts are periodically halved, so items that were once popular
+    but are no longer accessed eventually lose their protection against
+    eviction.  Decay is triggered every `decay_period` cache accesses
+    (counting `__getitem__` hits and `__setitem__` calls), or, if a
+    `clock` function is supplied, whenever the clock has advanced by at
+    least `decay_period` since the last decay.  Since decayed counts are
+    floored at 1 and the access counter is reset on each decay, counts
+    stay bounded no matter how long the cache runs.
+
+    Like `LFUCache`, cache hits are O(1); the periodic decay pass is
+    O(n) in the number of cached items.  Items with equal (decayed)
+    counts are ordered stably by the time they reached their count, so
+    `popitem` evicts the least recently used item among the least
+    frequently used ones.
+    """
+
+    class _Link:
+        __slots__ = ("count", "keys", "next", "prev")
+
+        def __init__(self, count):
+            self.count = count
+            self.keys = {}  # insertion ordered: least recently counted first
+
+        def unlink(self):
+            next = self.next
+            prev = self.prev
+            prev.next = next
+            next.prev = prev
+
+    def __init__(self, maxsize, getsizeof=None, decay_period=1000, clock=None):
+        if decay_period <= 0:
+            raise ValueError("decay_period must be positive")
+        Cache.__init__(self, maxsize, getsizeof)
+        self.__decay_period = decay_period
+        self.__clock = clock
+        self.__accesses = 0
+        self.__last_decay = clock() if clock is not None else None
+        self.__root = root = DecayingLFUCache._Link(0)  # sentinel
+        root.prev = root.next = root
+        self.__links = {}
+
+    def __getitem__(self, key, cache_getitem=Cache.__getitem__):
+        value = cache_getitem(self, key)
+        if key in self:  # __missing__ may not store item
+            self.__tick()
+            self.__touch(key)
+        return value
+
+    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+        cache_setitem(self, key, value)
+        self.__tick()
+        if key in self.__links:
+            self.__touch(key)
+            return
+        root = self.__root
+        link = root.next
+        if link.count != 1:
+            link = DecayingLFUCache._Link(1)
+            link.next = root.next
+            root.next = link.next.prev = link
+            link.prev = root
+        link.keys[key] = None
+        self.__links[key] = link
+
+    def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+        cache_delitem(self, key)
+        link = self.__links.pop(key)
+        del link.keys[key]
+        if not link.keys:
+            link.unlink()
+
+    def popitem(self):
+        """Remove and return the `(key, value)` pair least frequently used.
+
+        Ties are broken by stable recency order: among the least
+        frequently used items, the one that reached its current count
+        first is removed.
+        """
+        root = self.__root
+        curr = root.next
+        if curr is root:
+            raise KeyError("%s is empty" % type(self).__name__) from None
+        key = next(iter(curr.keys))  # least recently counted element
+        return (key, self.pop(key))
+
+    def clear(self):
+        Cache.clear(self)
+        root = self.__root
+        root.prev = root.next = root
+        self.__links.clear()
+        self.__accesses = 0
+
+    def __tick(self):
+        """Record one access and decay counts when the period elapses."""
+        if self.__clock is not None:
+            now = self.__clock()
+            if now - self.__last_decay >= self.__decay_period:
+                self.__last_decay = now
+                self.__decay()
+        else:
+            self.__accesses += 1
+            if self.__accesses >= self.__decay_period:
+                self.__accesses = 0
+                self.__decay()
+
+    def __decay(self):
+        """Halve all use counts, merging links with equal decayed counts.
+
+        Keys of a less frequent link are merged before keys of a more
+        frequent link, preserving a stable recency order within each
+        decayed count.
+        """
+        root = self.__root
+        link = root.next
+        while link is not root:
+            succ = link.next
+            link.count = max(1, link.count // 2)
+            prev = link.prev
+            if prev is not root and prev.count == link.count:
+                for key in link.keys:
+                    self.__links[key] = prev
+                prev.keys.update(link.keys)
+                link.unlink()
+            link = succ
+
+    def __touch(self, key):
+        """Increment use count"""
+        link = self.__links[key]
+        curr = link.next
+        if curr.count != link.count + 1:
+            if len(link.keys) == 1:
+                link.count += 1
+                return
+            curr = DecayingLFUCache._Link(link.count + 1)
+            curr.next = link.next
+            link.next = curr.next.prev = curr
+            curr.prev = link
+        curr.keys[key] = None
+        del link.keys[key]
         if not link.keys:
             link.unlink()
         self.__links[key] = curr
