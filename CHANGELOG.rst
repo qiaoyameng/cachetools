@@ -1,3 +1,13 @@
+v7.3.0 (unreleased)
+===================
+
+- Add ``DecayingLFUCache``, an LFU cache whose use counts are halved
+  periodically.  The decay period is configured either in terms of
+  cache accesses or of time reported by an injected timer function.
+  Keys with the same frequency are evicted least-recently-used first,
+  and this recency tie-breaking order survives decays.
+
+
 v7.2.0 (2026-09-16)
 ===================
 

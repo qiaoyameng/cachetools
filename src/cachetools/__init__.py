@@ -2,6 +2,7 @@
 
 __all__ = (
     "Cache",
+    "DecayingLFUCache",
     "FIFOCache",
     "LFUCache",
     "LRUCache",
@@ -282,6 +283,207 @@ class LFUCache(Cache):
         if not link.keys:
             link.unlink()
         self.__links[key] = curr
+
+
+class DecayingLFUCache(Cache):
+    """Least Frequently Used (LFU) cache with periodic frequency decay.
+
+    Unlike :class:`LFUCache`, whose use counts grow without bound and
+    thus protect historical hot spots indefinitely, this cache halves
+    every item's use count (integer division) once per *decay_period*.
+
+    The decay schedule is configured in one of two ways:
+
+    * without a *timer*, *decay_period* is the number of cache accesses
+      (successful ``cache[key]`` lookups and ``cache[key] = value``
+      operations) after which the counts decay;
+    * with an injected zero-argument *timer*, *decay_period* is the
+    amount of (non-negative) clock time that must elapse, according to
+    *timer*, before the counts decay on the next access.
+
+    Keys sharing a frequency bucket are ordered least-to-most recently
+    used; this tie-breaking order is preserved when buckets merge
+    during decay.  As a result, :meth:`popitem` always removes the
+    least frequently used key, breaking ties towards the least recently
+    used one, deterministically and without scanning the whole cache on
+    every hit.
+
+    """
+
+    class _Link:
+        __slots__ = ("count", "keys", "next", "prev")
+
+        def __init__(self, count):
+            self.count = count
+            self.keys = collections.OrderedDict()
+
+        def unlink(self):
+            next = self.next
+            prev = self.prev
+            prev.next = next
+            next.prev = prev
+
+    def __init__(self, maxsize, decay_period, timer=None, getsizeof=None):
+        if decay_period <= 0:
+            raise ValueError("decay_period must be positive")
+        Cache.__init__(self, maxsize, getsizeof)
+        self.__root = root = DecayingLFUCache._Link(0)  # sentinel
+        root.prev = root.next = root
+        self.__links = {}
+        self.__order = collections.OrderedDict()
+        self.__decay_period = decay_period
+        self.__timer = timer
+        self.__events = 0
+        self.__last_decay = timer() if timer is not None else 0
+
+    def __getitem__(self, key, cache_getitem=Cache.__getitem__):
+        self.__tick()
+        value = cache_getitem(self, key)
+        if key in self:  # __missing__ may not store item
+            self.__touch(key)
+        return value
+
+    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+        self.__tick()
+        cache_setitem(self, key, value)
+        if key in self.__links:
+            self.__touch(key)
+            return
+        self.__insert(key)
+
+    def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+        cache_delitem(self, key)
+        link = self.__links.pop(key)
+        del link.keys[key]
+        del self.__order[key]
+        if not link.keys:
+            link.unlink()
+
+    def popitem(self):
+        """Remove and return the least frequently, then least recently
+        used `(key, value)` pair.
+
+        """
+        root = self.__root
+        curr = root.next
+        if curr is root:
+            raise KeyError("%s is empty" % type(self).__name__) from None
+        key = next(iter(curr.keys))  # least recently used in the LFU bucket
+        return (key, self.pop(key))
+
+    def clear(self):
+        Cache.clear(self)
+        root = self.__root
+        root.prev = root.next = root
+        self.__links.clear()
+        self.__order.clear()
+        self.__events = 0
+        if self.__timer is not None:
+            self.__last_decay = self.__timer()
+
+    @property
+    def decay_period(self):
+        """The number of accesses or clock units between frequency decays."""
+        return self.__decay_period
+
+    @property
+    def timer(self):
+        """The timer function used by the cache, or `None` in access mode."""
+        return self.__timer
+
+    def __insert(self, key):
+        root = self.__root
+        link = root.next
+        if link is root or link.count > 1:
+            # empty chain, or every existing bucket is above count 1
+            link = DecayingLFUCache._Link(1)
+            link.next = root.next
+            root.next = link.next.prev = link
+            link.prev = root
+        elif link.count == 0:
+            # a decay leaves a (head) count-0 bucket in place; locate
+            # or create the count-1 bucket directly behind it
+            nxt = link.next
+            if nxt is not root and nxt.count == 1:
+                link = nxt
+            else:
+                one = DecayingLFUCache._Link(1)
+                one.prev = link
+                one.next = nxt
+                link.next = nxt.prev = one
+                link = one
+        link.keys[key] = None
+        self.__links[key] = link
+        self.__order[key] = None
+
+    def __touch(self, key):
+        """Increment use count, keeping the within-bucket recency order."""
+        link = self.__links[key]
+        curr = link.next
+        if curr.count != link.count + 1:
+            if len(link.keys) == 1:
+                link.count += 1
+                self.__order.move_to_end(key)
+                return
+            curr = DecayingLFUCache._Link(link.count + 1)
+            curr.next = link.next
+            link.next = curr.next.prev = curr
+            curr.prev = link
+        curr.keys[key] = None
+        del link.keys[key]
+        if not link.keys:
+            link.unlink()
+        self.__links[key] = curr
+        self.__order.move_to_end(key)
+
+    def __decay(self):
+        """Halve all use counts (floor), rebuilding the bucket chain."""
+        root = self.__root
+        root.prev = root.next = root
+        groups = collections.OrderedDict()
+        for key in self.__order:  # least to most recently used
+            count = self.__links[key].count // 2
+            try:
+                link = groups[count]
+            except KeyError:
+                link = groups[count] = DecayingLFUCache._Link(count)
+            link.keys[key] = None
+            self.__links[key] = link
+        # keys within each bucket already follow global least-to-most
+        # recent order; link the buckets by (halved) count ascending
+        for count in sorted(groups):
+            link = groups[count]
+            link.next = root
+            link.prev = prev = root.prev
+            prev.next = root.prev = link
+
+    def __tick(self):
+        """Record one access and apply any due frequency decays."""
+        timer = self.__timer
+        if timer is None:
+            self.__events += 1
+            if self.__events >= self.__decay_period:
+                self.__events = 0
+                if self.__links:
+                    self.__decay()
+        else:
+            elapsed = timer() - self.__last_decay
+            if elapsed < 0:  # tolerate non-monotonic injected clocks
+                elapsed = 0
+                self.__last_decay = timer()
+            due = 0
+            while elapsed >= self.__decay_period:
+                elapsed -= self.__decay_period
+                due += 1
+            if due:
+                self.__last_decay += due * self.__decay_period
+                if self.__links:
+                    # counts reach zero after only a few halvings, so
+                    # skip the remaining decays once every bucket did
+                    for _ in range(due):
+                        self.__decay()
+                        if self.__root.prev.count == 0:
+                            break
 
 
 class LRUCache(Cache):

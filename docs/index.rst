@@ -92,10 +92,29 @@ inserted into the cache.
    This class counts how often an item is retrieved, and discards the
    items used least often to make space when necessary.
 
+.. autoclass:: DecayingLFUCache(maxsize, decay_period, timer=None, getsizeof=None)
+   :members: decay_period, popitem, timer
+
+   This class counts how often an item is retrieved like
+   :class:`LFUCache`, but periodically halves (integer division) all
+   use counts so that items that were hot in the past but are no longer
+   accessed become evictable again.
+
+   If no *timer* is supplied, the use counts decay once after
+   *decay_period* cache accesses (``cache[key]`` lookups and
+   ``cache[key] = value`` assignments).  In this mode no item's use
+   count can ever exceed roughly ``2 * decay_period``.  If a zero
+   argument *timer* callable is supplied, *decay_period* is interpreted
+   as the amount of clock time that must pass (as reported by *timer*)
+   between decays, which are applied lazily on the next access.
+
+   Items with the same decayed frequency are evicted in least recently
+   used order.
+
 .. autoclass:: LRUCache(maxsize, getsizeof=None)
    :members: popitem
 
-   This class discards the least recently used items first to make
+   This class discards the least recently used items first to make 
    space when necessary.
 
 .. autoclass:: RRCache(maxsize, choice=random.choice, getsizeof=None)
