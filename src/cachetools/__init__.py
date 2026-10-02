@@ -2,6 +2,7 @@
 
 __all__ = (
     "Cache",
+    "ARCCache",
     "FIFOCache",
     "LFUCache",
     "LRUCache",
@@ -18,6 +19,7 @@ import collections
 import collections.abc
 import functools
 import heapq
+import math
 import random
 import time
 
@@ -324,6 +326,221 @@ class LRUCache(Cache):
             self.__order.move_to_end(key)
         except KeyError:
             self.__order[key] = None
+
+
+class ARCCache(Cache):
+    """Adaptive Replacement Cache (ARC) implementation.
+
+    The cache divides resident entries into a recent list ``T1`` and a
+    repeated list ``T2``.  ``B1`` and ``B2`` are ghost lists containing
+    only keys evicted from ``T1`` and ``T2``; evicted values are not
+    retained.  A hit in ``B1`` moves the target capacity for ``T1``
+    upward, while a hit in ``B2`` moves it downward.
+
+    The target capacity is measured in the same units as ``maxsize`` and
+    ``getsizeof``.  A target adjustment uses whole capacity units and is
+    at least one unit, with its magnitude derived from the relative
+    number of records in the two ghost lists.  Ghost records have no
+    value weight; their counts are capped independently and together
+    with the weighted resident lists.
+
+    After every operation, resident entries occupy at most ``maxsize``
+    weight units.  The number of ``B1`` records is at most ``maxsize``,
+    the weighted size of ``T1`` plus that count is at most ``maxsize``,
+    the analogous sum for ``T2`` and ``B2`` is at most ``2 * maxsize``,
+    and resident weight plus ghost records is at most ``2 * maxsize``.
+    """
+
+    def __init__(self, maxsize, getsizeof=None):
+        Cache.__init__(self, maxsize, getsizeof)
+        self.__t1 = collections.OrderedDict()
+        self.__t2 = collections.OrderedDict()
+        self.__b1 = collections.OrderedDict()
+        self.__b2 = collections.OrderedDict()
+        self.__t1size = 0
+        self.__t2size = 0
+        self.__target = 0
+        self.__case = 0
+        self.__replacing = False
+
+    def __getitem__(self, key, cache_getitem=Cache.__getitem__):
+        value = cache_getitem(self, key)
+        if key in self:  # __missing__ may not store item
+            self.__touch(key)
+        return value
+
+    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+        size = self.getsizeof(value)
+        if size < 0:
+            raise ValueError("value size must be non-negative")
+        if size > self.maxsize:
+            raise ValueError("value too large")
+
+        if key in self.__t1 or key in self.__t2:
+            case = 3
+        elif key in self.__b1:
+            self.__adapt(1)
+            case = 1
+        elif key in self.__b2:
+            self.__adapt(-1)
+            case = 2
+        else:
+            case = 0
+
+        self.__case = case
+        self.__replacing = True
+        try:
+            cache_setitem(self, key, value)
+        finally:
+            self.__replacing = False
+            self.__case = 0
+
+        self.__track(key, size, frequent=bool(case))
+        self.__trim_ghosts()
+
+    def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+        cache_delitem(self, key)
+        if key in self.__t1:
+            self.__t1size -= self.__t1.pop(key)
+        else:
+            self.__t2size -= self.__t2.pop(key)
+
+    def popitem(self):
+        """Remove and return an adaptive-cache-selected `(key, value)` pair."""
+        if not self.__t1 and not self.__t2:
+            raise KeyError("%s is empty" % type(self).__name__) from None
+
+        maxsize = self.maxsize
+        target = self.__target
+        discard_recent = False
+
+        if self.__replacing and self.__case == 0:
+            recent_weight = self.__t1size + len(self.__b1)
+            total_weight = (
+                self.__t1size + self.__t2size + len(self.__b1) + len(self.__b2)
+            )
+            if recent_weight < maxsize and total_weight >= 2 * maxsize:
+                if self.__b2:
+                    self.__b2.popitem(last=False)
+                elif self.__b1:
+                    self.__b1.popitem(last=False)
+
+            recent_weight = self.__t1size + len(self.__b1)
+            if recent_weight >= maxsize:
+                if self.__b1 and self.__t1size < maxsize:
+                    self.__b1.popitem(last=False)
+                    target = maxsize
+                    recent_weight = self.__t1size + len(self.__b1)
+                if recent_weight >= maxsize and self.__t1:
+                    discard_recent = True
+
+        if self.__t1 and (
+            self.__t1size >= target
+            or not self.__t2
+        ):
+            key = next(iter(self.__t1))
+            resident = self.__t1
+            resident_size = self.__t1size
+            ghost = self.__b1
+            keep_ghost = not discard_recent
+        else:
+            key = next(iter(self.__t2 or self.__t1))
+            if key in self.__t2:
+                resident = self.__t2
+                resident_size = self.__t2size
+                ghost = self.__b2
+            else:
+                resident = self.__t1
+                resident_size = self.__t1size
+                ghost = self.__b1
+
+        value = Cache.__getitem__(self, key)
+        size = resident.pop(key)
+        if resident is self.__t1:
+            self.__t1size = resident_size - size
+            if not keep_ghost:
+                ghost = None
+        else:
+            self.__t2size = resident_size - size
+        Cache.__delitem__(self, key)
+        if ghost is not None:
+            ghost[key] = None
+        self.__trim_ghosts()
+        return key, value
+
+    def clear(self):
+        Cache.clear(self)
+        self.__t1.clear()
+        self.__t2.clear()
+        self.__b1.clear()
+        self.__b2.clear()
+        self.__t1size = 0
+        self.__t2size = 0
+        self.__target = 0
+        self.__case = 0
+        self.__replacing = False
+
+    def __touch(self, key):
+        if key in self.__t2:
+            self.__t2.move_to_end(key)
+        elif key in self.__t1:
+            size = self.__t1.pop(key)
+            self.__t1size -= size
+            self.__t2[key] = size
+            self.__t2size += size
+
+    def __track(self, key, size, frequent):
+        marker = object()
+        old_size = self.__t1.pop(key, marker)
+        if old_size is not marker:
+            self.__t1size -= old_size
+        old_size = self.__t2.pop(key, marker)
+        if old_size is not marker:
+            self.__t2size -= old_size
+        self.__b1.pop(key, None)
+        self.__b2.pop(key, None)
+        if frequent:
+            self.__t2[key] = size
+            self.__t2size += size
+        else:
+            self.__t1[key] = size
+            self.__t1size += size
+
+    def __adapt(self, direction):
+        if direction > 0:
+            if self.__b1:
+                ratio = len(self.__b2) / len(self.__b1)
+                delta = self.maxsize if math.isinf(ratio) else math.ceil(ratio)
+            else:
+                delta = 1
+            self.__target = min(self.maxsize, self.__target + max(1, delta))
+        else:
+            if self.__b2:
+                ratio = len(self.__b1) / len(self.__b2)
+                delta = self.maxsize if math.isinf(ratio) else math.ceil(ratio)
+            else:
+                delta = 1
+            self.__target = max(0, self.__target - max(1, delta))
+
+    def __trim_ghosts(self):
+        maxsize = self.maxsize
+        while len(self.__b1) > maxsize:
+            self.__b1.popitem(last=False)
+        while len(self.__b2) > 2 * maxsize:
+            self.__b2.popitem(last=False)
+        while self.__t1size + len(self.__b1) > maxsize:
+            self.__b1.popitem(last=False)
+        while self.__t2size + len(self.__b2) > 2 * maxsize:
+            self.__b2.popitem(last=False)
+        total_weight = (
+            self.__t1size + self.__t2size + len(self.__b1) + len(self.__b2)
+        )
+        while total_weight > 2 * maxsize:
+            if self.__b2:
+                self.__b2.popitem(last=False)
+            else:
+                self.__b1.popitem(last=False)
+            total_weight -= 1
 
 
 class RRCache(Cache):

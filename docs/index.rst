@@ -98,6 +98,17 @@ inserted into the cache.
    This class discards the least recently used items first to make
    space when necessary.
 
+.. autoclass:: ARCCache(maxsize, getsizeof=None)
+   :members: popitem
+
+   This class adaptively divides its capacity between one-time and
+   repeatedly referenced items.  Evicted keys remain in bounded ghost
+   lists until the ghost information itself is evicted; evicted values
+   are not retained.  A reference to a ghost key adjusts the target
+   capacity for the recent and repeated resident lists.  With
+   ``getsizeof``, both capacities and adjustments are measured in the
+   same weight units returned by ``getsizeof``.
+
 .. autoclass:: RRCache(maxsize, choice=random.choice, getsizeof=None)
    :members: choice, popitem
 
