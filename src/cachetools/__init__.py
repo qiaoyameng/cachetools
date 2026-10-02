@@ -1,6 +1,7 @@
 """Extensible memoizing collections and decorators."""
 
 __all__ = (
+    "ARCCache",
     "Cache",
     "FIFOCache",
     "LFUCache",
@@ -325,6 +326,275 @@ class LRUCache(Cache):
         except KeyError:
             self.__order[key] = None
 
+
+class ARCCache(Cache):
+    """Adaptive Replacement Cache (ARC) implementation.
+
+    Resident entries are split between a recent and a frequent list.
+    Ghost lists remember only each evicted key and its weight; they
+    never retain evicted values.  The target size of the recent list is
+    kept in the same units as :meth:`getsizeof`.  A ghost hit changes
+    it by the hit ghost's weight, multiplied by the ratio of the number
+    of entries in the two ghost lists when that is greater than one.
+
+    """
+
+    def __init__(self, maxsize, getsizeof=None):
+        Cache.__init__(self, maxsize, getsizeof)
+        self.__recent = collections.OrderedDict()
+        self.__frequent = collections.OrderedDict()
+        self.__recent_ghosts = collections.OrderedDict()
+        self.__frequent_ghosts = collections.OrderedDict()
+        self.__recent_size = 0
+        self.__frequent_size = 0
+        self.__recent_ghost_size = 0
+        self.__frequent_ghost_size = 0
+        self.__target_size = 0
+        self.__ghost_hit_key = None
+        self.__ghost_hit_frequent = False
+        self.__replace_from_frequent_ghost = False
+
+    def __getitem__(self, key, cache_getitem=Cache.__getitem__):
+        was_resident = key in self
+        was_recent_ghost = key in self.__recent_ghosts
+        was_frequent_ghost = key in self.__frequent_ghosts
+        if was_recent_ghost or was_frequent_ghost:
+            self.__adapt(key, was_recent_ghost)
+            self.__discard_ghost(key)
+            self.__ghost_hit_key = key
+            self.__ghost_hit_frequent = was_frequent_ghost
+        try:
+            value = cache_getitem(self, key)
+        finally:
+            self.__ghost_hit_key = None
+            self.__ghost_hit_frequent = False
+        if was_resident:
+            self.__touch(key)
+        return value
+
+    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+        size = self.getsizeof(value)
+        if size < 0:
+            raise ValueError("value size must be non-negative")
+        if size > self.maxsize:
+            raise ValueError("value too large")
+
+        ghost_hit = self.__ghost_hit_key == key
+        was_recent_ghost = key in self.__recent_ghosts or (
+            ghost_hit and not self.__ghost_hit_frequent
+        )
+        was_frequent_ghost = key in self.__frequent_ghosts or (
+            ghost_hit and self.__ghost_hit_frequent
+        )
+        was_recent = key in self.__recent
+        was_frequent = key in self.__frequent
+
+        if key in self.__recent_ghosts or key in self.__frequent_ghosts:
+            self.__adapt(key, was_recent_ghost)
+            self.__discard_ghost(key)
+
+        self.__replace_from_frequent_ghost = was_frequent_ghost
+        try:
+            cache_setitem(self, key, value)
+        finally:
+            self.__replace_from_frequent_ghost = False
+
+        self.__discard_ghost(key)
+        if key not in self:
+            return
+        if was_recent_ghost or was_frequent_ghost:
+            self.__add(self.__frequent, key, size)
+            self.__frequent_size += size
+        elif was_recent:
+            if key in self.__recent:
+                self.__remove_resident(key)
+                self.__add(self.__frequent, key, size)
+                self.__frequent_size += size
+            elif key in self.__frequent:
+                self.__remove_resident(key)
+                self.__frequent[key] = size
+                self.__frequent_size += size
+            else:
+                self.__add(self.__recent, key, size)
+                self.__recent_size += size
+        else:
+            if key in self.__frequent:
+                self.__remove_resident(key)
+                self.__frequent[key] = size
+                self.__frequent_size += size
+                self.__frequent.move_to_end(key)
+            elif key in self.__recent:
+                self.__remove_resident(key)
+                self.__recent[key] = size
+                self.__recent_size += size
+                self.__recent.move_to_end(key)
+            else:
+                self.__add(self.__recent, key, size)
+                self.__recent_size += size
+
+    def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+        cache_delitem(self, key)
+        self.__remove_resident(key)
+
+    def popitem(self):
+        """Remove and return a selected `(key, value)` pair."""
+        recent = self.__recent
+        frequent = self.__frequent
+        if not recent and not frequent:
+            raise KeyError("%s is empty" % type(self).__name__) from None
+
+        from_frequent_ghost = self.__replace_from_frequent_ghost
+        if from_frequent_ghost:
+            self.__prepare_frequent_ghost_replacement()
+        source = self.__replacement_candidate(from_frequent_ghost)
+        key = next(iter(source))
+        size = source[key]
+        target_ghosts = (
+            self.__recent_ghosts
+            if source is recent
+            else self.__frequent_ghosts
+        )
+        self.__make_ghost_room(size, source is recent)
+        value = Cache.__getitem__(self, key)
+        del self[key]
+        target_ghosts[key] = size
+        if source is recent:
+            self.__recent_ghost_size += size
+        else:
+            self.__frequent_ghost_size += size
+        return (key, value)
+
+    def clear(self):
+        Cache.clear(self)
+        self.__recent.clear()
+        self.__frequent.clear()
+        self.__recent_ghosts.clear()
+        self.__frequent_ghosts.clear()
+        self.__recent_size = 0
+        self.__frequent_size = 0
+        self.__recent_ghost_size = 0
+        self.__frequent_ghost_size = 0
+        self.__target_size = 0
+
+    def __touch(self, key):
+        """Promote or mark a resident key as recently used."""
+        if key in self.__frequent:
+            self.__frequent.move_to_end(key)
+        elif key in self.__recent:
+            size = self.__remove_resident(key)
+            self.__frequent[key] = size
+            self.__frequent_size += size
+
+    def __adapt(self, key, recent_ghost, size=None):
+        recent_ghosts = self.__recent_ghosts
+        frequent_ghosts = self.__frequent_ghosts
+        if size is None:
+            size = (
+                recent_ghosts[key] if recent_ghost else frequent_ghosts[key]
+            )
+        own_count = len(recent_ghosts if recent_ghost else frequent_ghosts)
+        other_count = len(frequent_ghosts if recent_ghost else recent_ghosts)
+        factor = max(1.0, other_count / own_count) if own_count else 1.0
+        adjustment = size * factor
+        if recent_ghost:
+            self.__target_size = min(
+                self.maxsize, self.__target_size + adjustment
+            )
+        else:
+            self.__target_size = max(0, self.__target_size - adjustment)
+
+    def __replacement_candidate(self, from_frequent_ghost=False):
+        recent = self.__recent
+        frequent = self.__frequent
+        if not recent:
+            return frequent
+        if not frequent:
+            return recent
+        recent_size = self.__recent_size
+        replace_recent = (
+            recent_size >= self.__target_size
+            if self.__recent_ghosts
+            else recent_size > self.__target_size
+        )
+        if from_frequent_ghost and recent_size >= self.maxsize:
+            replace_recent = True
+        return recent if replace_recent else frequent
+
+    def __prepare_frequent_ghost_replacement(self):
+        maxsize = self.maxsize
+        recent_total = self.__recent_size + self.__recent_ghost_size
+        metadata_size = (
+            self.__recent_size
+            + self.__frequent_size
+            + self.__recent_ghost_size
+            + self.__frequent_ghost_size
+        )
+        if recent_total == maxsize:
+            while recent_total == maxsize and self.__recent_ghosts:
+                _, size = self.__recent_ghosts.popitem(last=False)
+                self.__recent_ghost_size -= size
+                recent_total -= size
+        elif metadata_size == 2 * maxsize:
+            while (
+                metadata_size == 2 * maxsize
+                and self.__frequent_ghosts
+            ):
+                _, size = self.__frequent_ghosts.popitem(last=False)
+                self.__frequent_ghost_size -= size
+                metadata_size -= size
+
+    def __make_ghost_room(self, size, evict_recent):
+        recent_ghosts = self.__recent_ghosts
+        frequent_ghosts = self.__frequent_ghosts
+        while (
+            self.__recent_ghost_size
+            + self.__frequent_ghost_size
+            + size
+            > self.maxsize
+        ):
+            if evict_recent and frequent_ghosts:
+                _, removed_size = frequent_ghosts.popitem(last=False)
+                self.__frequent_ghost_size -= removed_size
+            elif not evict_recent and recent_ghosts:
+                _, removed_size = recent_ghosts.popitem(last=False)
+                self.__recent_ghost_size -= removed_size
+            else:
+                target = recent_ghosts if evict_recent else frequent_ghosts
+                other = frequent_ghosts if evict_recent else recent_ghosts
+                try:
+                    _, removed_size = target.popitem(last=False)
+                except KeyError:
+                    _, removed_size = other.popitem(last=False)
+                if target is recent_ghosts:
+                    self.__recent_ghost_size -= removed_size
+                else:
+                    self.__frequent_ghost_size -= removed_size
+
+    def __discard_ghost(self, key):
+        try:
+            self.__recent_ghost_size -= self.__recent_ghosts.pop(key)
+        except KeyError:
+            try:
+                self.__frequent_ghost_size -= (
+                    self.__frequent_ghosts.pop(key)
+                )
+            except KeyError:
+                pass
+
+    def __remove_resident(self, key):
+        try:
+            size = self.__recent.pop(key)
+        except KeyError:
+            size = self.__frequent.pop(key)
+            self.__frequent_size -= size
+        else:
+            self.__recent_size -= size
+        return size
+
+    @staticmethod
+    def __add(queue, key, size):
+        queue[key] = size
+        queue.move_to_end(key)
 
 class RRCache(Cache):
     """Random Replacement (RR) cache implementation."""
