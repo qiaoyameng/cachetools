@@ -6,6 +6,7 @@ __all__ = (
     "LFUCache",
     "LRUCache",
     "RRCache",
+    "ExpireResult",
     "TLRUCache",
     "TTLCache",
     "cached",
@@ -40,6 +41,14 @@ class _DefaultSize:
 
     def clear(self):
         pass
+
+
+class ExpireResult(list):
+    __slots__ = ("checked",)
+
+    def __init__(self, iterable=(), *, checked=0):
+        super().__init__(iterable)
+        self.checked = checked
 
 
 class Cache(collections.abc.MutableMapping):
@@ -166,6 +175,12 @@ class Cache(collections.abc.MutableMapping):
     def getsizeof(value):
         """Return the size of a cache element's value."""
         return 1
+
+    def _sizeof(self, key):
+        return self.__size[key]
+
+    def _physical_currsize(self):
+        return self.__currsize
 
 
 class FIFOCache(Cache):
@@ -410,16 +425,14 @@ class _TimedCache(Cache):
             self.expire(time)
             return cache_repr(self)
 
-    def __len__(self, cache_len=Cache.__len__):
+    def __len__(self):
         with self.__timer as time:
-            self.expire(time)
-            return cache_len(self)
+            return self._count_active(time)
 
     @property
     def currsize(self):
         with self.__timer as time:
-            self.expire(time)
-            return super().currsize
+            return self._active_size(time)
 
     @property
     def timer(self):
@@ -446,6 +459,17 @@ class _TimedCache(Cache):
 
     def expire(self, time=None):  # pragma: no cover
         raise NotImplementedError
+
+    def _count_active(self, time):  # pragma: no cover
+        raise NotImplementedError
+
+    def _active_size(self, time):  # pragma: no cover
+        raise NotImplementedError
+
+    @staticmethod
+    def _check_budget(budget):
+        if budget is not None and (not isinstance(budget, int) or budget < 0):
+            raise ValueError("budget must be a non-negative integer or None")
 
 
 class TTLCache(_TimedCache):
@@ -505,9 +529,14 @@ class TTLCache(_TimedCache):
         else:
             link.unlink()
         link.expires = time + self.__ttl
-        link.next = root = self.__root
-        link.prev = prev = root.prev
-        prev.next = root.prev = link
+        root = self.__root
+        curr = root.prev
+        while curr is not root and link.expires < curr.expires:
+            curr = curr.prev
+        link.next = curr.next
+        link.prev = curr
+        curr.next.prev = link
+        curr.next = link
 
     def __delitem__(self, key, cache_delitem=Cache.__delitem__):
         cache_delitem(self, key)
@@ -541,20 +570,23 @@ class TTLCache(_TimedCache):
         """The time-to-live value of the cache's items."""
         return self.__ttl
 
-    def expire(self, time=None):
-        """Remove expired items from the cache and return an iterable of the
-        expired `(key, value)` pairs.
+    def expire(self, time=None, budget=None):
+        """Remove expired items and return them as an `ExpireResult`.
 
         """
+        self._check_budget(budget)
         if time is None:
             time = self.timer()
         root = self.__root
         curr = root.next
         links = self.__links
-        expired = []
+        expired = ExpireResult()
         cache_delitem = Cache.__delitem__
         cache_getitem = Cache.__getitem__
-        while curr is not root and not (time < curr.expires):
+        while curr is not root and (budget is None or expired.checked < budget):
+            expired.checked += 1
+            if time < curr.expires:
+                break
             expired.append((curr.key, cache_getitem(self, curr.key)))
             cache_delitem(self, curr.key)
             del links[curr.key]
@@ -562,6 +594,33 @@ class TTLCache(_TimedCache):
             curr.unlink()
             curr = next
         return expired
+
+    def _count_active(self, time):
+        root = self.__root
+        curr = root.next
+        expired = 0
+        while curr is not root and not (time < curr.expires):
+            expired += 1
+            curr = curr.next
+        if curr is root:
+            return 0
+        if expired == 0:
+            return Cache.__len__(self)
+        return Cache.__len__(self) - expired
+
+    def _active_size(self, time):
+        root = self.__root
+        curr = root.next
+        expired_size = 0
+        while curr is not root and not (time < curr.expires):
+            expired_size += self._sizeof(curr.key)
+            curr = curr.next
+        if curr is root:
+            return 0
+        physical_size = self._physical_currsize()
+        if expired_size == 0:
+            return physical_size
+        return physical_size - expired_size
 
     def popitem(self):
         """Remove and return the `(key, value)` pair least recently used that
@@ -671,29 +730,55 @@ class TLRUCache(_TimedCache):
         """The local time-to-use function used by the cache."""
         return self.__ttu
 
-    def expire(self, time=None):
-        """Remove expired items from the cache and return an iterable of the
-        expired `(key, value)` pairs.
+    def expire(self, time=None, budget=None):
+        """Remove expired items and return them as an `ExpireResult`.
 
         """
+        self._check_budget(budget)
         if time is None:
             time = self.timer()
         items = self.__items
         order = self.__order
-        # clean up the heap if too many items are marked as removed
-        if len(order) > len(items) * self.__HEAP_CLEANUP_FACTOR:
+        # A bounded cleanup must not scan the whole heap before doing its
+        # chargeable work. Removed heap entries are popped incrementally
+        # instead, and therefore also count against the budget.
+        if budget is None and len(order) > len(items) * self.__HEAP_CLEANUP_FACTOR:
             self.__order = order = [item for item in order if not item.removed]
             heapq.heapify(order)
-        expired = []
+        expired = ExpireResult()
         cache_delitem = Cache.__delitem__
         cache_getitem = Cache.__getitem__
-        while order and (order[0].removed or not (time < order[0].expires)):
-            item = heapq.heappop(order)
+        while (
+            order
+            and (budget is None or expired.checked < budget)
+        ):
+            expired.checked += 1
+            item = order[0]
+            if item.removed or not (time < item.expires):
+                heapq.heappop(order)
+            else:
+                break
             if not item.removed:
                 expired.append((item.key, cache_getitem(self, item.key)))
                 cache_delitem(self, item.key)
                 del items[item.key]
         return expired
+
+    def _count_active(self, time):
+        order = self.__order
+        if order and not order[0].removed and time < order[0].expires:
+            return Cache.__len__(self)
+        return sum(time < item.expires for item in self.__items.values())
+
+    def _active_size(self, time):
+        order = self.__order
+        if order and not order[0].removed and time < order[0].expires:
+            return self._physical_currsize()
+        return sum(
+            self._sizeof(key)
+            for key, item in self.__items.items()
+            if time < item.expires
+        )
 
     def popitem(self):
         """Remove and return the `(key, value)` pair least recently used that

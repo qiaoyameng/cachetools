@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from cachetools import TTLCache
+from cachetools import ExpireResult, TTLCache
 
 from . import CacheTestMixin
 
@@ -176,6 +176,126 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
         self.assertNotIn(1, cache)
         self.assertNotIn(2, cache)
         self.assertNotIn(3, cache)
+
+    def test_ttl_expire_budget(self):
+        class VariableTTLCache(TTLCache):
+            def __init__(self):
+                super().__init__(maxsize=64, ttl=1, timer=Timer())
+
+            def __setitem__(self, key, value):
+                if key % 10 == 0:
+                    self._TTLCache__ttl = 100
+                    super().__setitem__(key, value)
+                    self._TTLCache__ttl = 0
+                else:
+                    self._TTLCache__ttl = 1
+                    super().__setitem__(key, value)
+
+        cache = VariableTTLCache()
+        for key in range(33):
+            cache[key] = key
+
+        cache.timer.tick()
+
+        expired = []
+        checked = []
+        while True:
+            batch = cache.expire(budget=2)
+            checked.append(batch.checked)
+            expired.extend(batch)
+            for long_key in (0, 10, 20, 30):
+                self.assertIn(long_key, cache)
+                self.assertEqual(long_key, cache[long_key])
+            self.assertEqual(4, len(cache))
+            self.assertEqual(4, cache.currsize)
+            if len(batch) == 0:
+                break
+
+        short_keys = [key for key in range(1, 33) if key % 10 != 0]
+        self.assertEqual([(key, key) for key in short_keys], expired)
+        self.assertEqual([2] * 15 + [1], checked)
+        self.assertEqual({0, 10, 20, 30}, set(cache))
+        self.assertEqual(4, len(cache))
+        self.assertEqual(4, cache.currsize)
+
+    def test_ttl_expire_budget_insertion(self):
+        timer = Timer()
+        cache = TTLCache(maxsize=64, ttl=1, timer=timer)
+        for key in range(8):
+            cache[key] = key
+
+        timer.tick()
+        first = cache.expire(budget=2)
+        self.assertEqual(2, first.checked)
+        cache[100] = 100
+        for key in range(8):
+            self.assertNotIn(key, cache)
+        self.assertEqual(100, cache[100])
+
+        batch = cache.expire(budget=2)
+        self.assertEqual([], batch)
+        self.assertEqual(1, batch.checked)
+        self.assertEqual(100, cache[100])
+
+    def test_ttl_expire_budget_custom_timer(self):
+        class RawTimer:
+            time = 0
+
+            def __call__(self):
+                return self.time
+
+        timer = RawTimer()
+        cache = TTLCache(maxsize=4, ttl=10, timer=timer)
+
+        timer.time = 100
+        cache["long"] = "long"
+        timer.time = 0
+        cache["short"] = "short"
+
+        batch = cache.expire(time=101, budget=1)
+        self.assertEqual([("short", "short")], list(batch))
+        self.assertEqual(1, batch.checked)
+        self.assertEqual("long", cache["long"])
+        self.assertEqual(1, len(cache))
+
+        timer.time = 1
+        self.assertEqual("long", cache["long"])
+        self.assertNotIn("short", cache)
+        self.assertEqual(1, len(cache))
+
+    def test_ttl_expire_budget_validation(self):
+        cache = TTLCache(maxsize=1, ttl=1, timer=Timer())
+        self.assertEqual(0, cache.expire(budget=0).checked)
+        self.assertIsInstance(cache.expire(), ExpireResult)
+        self.assertEqual(0, cache.expire(None, 0).checked)
+        with self.assertRaises(ValueError):
+            cache.expire(budget=-1)
+        with self.assertRaises(ValueError):
+            cache.expire(budget=1.0)
+
+    def test_ttl_expire_budget_getsizeof(self):
+        class RawTimer:
+            time = 0
+
+            def __call__(self):
+                return self.time
+
+        timer = RawTimer()
+        cache = TTLCache(
+            maxsize=10, ttl=2, timer=timer, getsizeof=lambda value: value
+        )
+        cache._TTLCache__ttl = 1
+        cache[1] = 1
+        cache._TTLCache__ttl = 2
+        cache[2] = 2
+
+        timer.time = 1
+        result = cache.expire(budget=1)
+
+        self.assertEqual(1, result.checked)
+        self.assertEqual([(1, 1)], result)
+        self.assertEqual(1, len(cache))
+        self.assertEqual(2, cache.currsize)
 
     def test_ttl_atomic(self):
         cache = TTLCache[int, int, int](maxsize=1, ttl=2, timer=Timer(auto=True))

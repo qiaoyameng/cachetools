@@ -21,6 +21,7 @@ __all__: Final = (
     "LFUCache",
     "LRUCache",
     "RRCache",
+    "ExpireResult",
     "TLRUCache",
     "TTLCache",
     "cached",
@@ -73,6 +74,9 @@ class RRCache(Cache[_KT, _VT]):
     @property
     def choice(self) -> Callable[[Sequence[_KT]], _KT]: ...
 
+class ExpireResult(list[tuple[_KT, _VT]]):
+    checked: int
+
 class _TimedCache(Cache[_KT, _VT], Generic[_KT, _VT, _TT]):
     def __init__(
         self,
@@ -110,7 +114,9 @@ class TTLCache(_TimedCache[_KT, _VT, _TT]):
     ) -> None: ...
     @property
     def ttl(self) -> Any: ...
-    def expire(self, time: _TT | None = None) -> list[tuple[_KT, _VT]]: ...
+    def expire(
+        self, time: _TT | None = None, budget: int | None = None
+    ) -> ExpireResult[_KT, _VT]: ...
 
 class TLRUCache(_TimedCache[_KT, _VT, _TT]):
     @overload
@@ -131,7 +137,9 @@ class TLRUCache(_TimedCache[_KT, _VT, _TT]):
     ) -> None: ...
     @property
     def ttu(self) -> Callable[[_KT, _VT, _TT], _TT]: ...
-    def expire(self, time: _TT | None = None) -> list[tuple[_KT, _VT]]: ...
+    def expire(
+        self, time: _TT | None = None, budget: int | None = None
+    ) -> ExpireResult[_KT, _VT]: ...
 
 class _CacheInfo(NamedTuple):
     hits: int

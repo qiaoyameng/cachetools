@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from cachetools import TLRUCache
+from cachetools import ExpireResult, TLRUCache
 
 from . import CacheTestMixin
 
@@ -216,6 +216,151 @@ class TLRUCacheTest(unittest.TestCase, CacheTestMixin):
         self.assertNotIn(1, cache)
         self.assertNotIn(2, cache)
         self.assertNotIn(3, cache)
+
+    def test_ttu_expire_budget(self):
+        cache = TLRUCache(
+            maxsize=64, ttu=lambda _key, value, now: now + value, timer=Timer()
+        )
+        for key in range(33):
+            cache[key] = 100 if key % 10 == 0 else 1
+
+        cache.timer.tick()
+
+        expired = []
+        checked = []
+        while True:
+            batch = cache.expire(budget=2)
+            checked.append(batch.checked)
+            expired.extend(batch)
+            for long_key in (0, 10, 20, 30):
+                self.assertIn(long_key, cache)
+                self.assertEqual(100, cache[long_key])
+            self.assertEqual(4, len(cache))
+            self.assertEqual(4, cache.currsize)
+            if len(batch) == 0:
+                break
+
+        short_keys = [key for key in range(1, 33) if key % 10 != 0]
+        self.assertEqual(sorted((key, 1) for key in short_keys), sorted(expired))
+        self.assertEqual([2] * 15 + [1], checked)
+        self.assertEqual({0, 10, 20, 30}, set(cache))
+        self.assertEqual(4, len(cache))
+        self.assertEqual(4, cache.currsize)
+
+    def test_ttu_expire_budget_insertion(self):
+        timer = Timer()
+        cache = TLRUCache(
+            maxsize=64, ttu=lambda _key, value, now: now + value, timer=timer
+        )
+        for key in range(8):
+            cache[key] = 1
+
+        timer.tick()
+        first = cache.expire(budget=2)
+        self.assertEqual(2, first.checked)
+        cache[100] = 100
+        for key in range(8):
+            self.assertNotIn(key, cache)
+        self.assertEqual(100, cache[100])
+
+        batch = cache.expire(budget=2)
+        self.assertEqual([], batch)
+        self.assertEqual(1, batch.checked)
+        self.assertEqual(100, cache[100])
+
+    def test_ttu_expire_budget_counts_removed_nodes(self):
+        cache = TLRUCache(
+            maxsize=4, ttu=lambda _key, value, now: now + value, timer=Timer()
+        )
+
+        cache[1] = 100
+        cache[2] = 100
+        cache[3] = 100
+        cache[4] = 1
+        del cache[4]
+
+        cache.timer.tick()
+
+        batch = cache.expire(budget=1)
+        self.assertEqual([], batch)
+        self.assertEqual(1, batch.checked)
+        self.assertEqual(100, cache[1])
+        self.assertEqual({1, 2, 3}, set(cache))
+
+        batch = cache.expire(budget=2)
+        self.assertEqual([], batch)
+        self.assertEqual(1, batch.checked)
+
+        cache[1] = 1
+        batch = cache.expire(budget=2)
+        self.assertEqual([], batch)
+        self.assertEqual(1, batch.checked)
+        self.assertEqual(1, cache[1])
+
+    def test_ttu_expire_budget_custom_timer(self):
+        class RawTimer:
+            time = 0
+
+            def __call__(self):
+                return self.time
+
+        timer = RawTimer()
+        cache = TLRUCache(
+            maxsize=4, ttu=lambda _key, value, now: now + value, timer=timer
+        )
+
+        timer.time = 100
+        cache["long"] = 100
+        timer.time = 0
+        cache["short"] = 1
+
+        batch = cache.expire(time=101, budget=1)
+        self.assertEqual([("short", 1)], list(batch))
+        self.assertEqual(1, batch.checked)
+        self.assertEqual(100, cache["long"])
+        self.assertEqual(1, len(cache))
+
+        timer.time = 1
+        self.assertEqual(100, cache["long"])
+        self.assertNotIn("short", cache)
+        self.assertEqual(1, len(cache))
+
+    def test_ttu_expire_budget_validation(self):
+        cache = TLRUCache(
+            maxsize=1, ttu=lambda _k, _v, t: t + 1, timer=Timer()
+        )
+        self.assertEqual(0, cache.expire(budget=0).checked)
+        self.assertIsInstance(cache.expire(), ExpireResult)
+        self.assertEqual(0, cache.expire(None, 0).checked)
+        with self.assertRaises(ValueError):
+            cache.expire(budget=-1)
+        with self.assertRaises(ValueError):
+            cache.expire(budget=1.0)
+
+    def test_ttu_expire_budget_getsizeof(self):
+        class RawTimer:
+            time = 0
+
+            def __call__(self):
+                return self.time
+
+        timer = RawTimer()
+        cache = TLRUCache(
+            maxsize=10,
+            ttu=lambda _key, value, now: now + value,
+            timer=timer,
+            getsizeof=lambda value: value,
+        )
+        cache[1] = 1
+        cache[2] = 2
+
+        timer.time = 1
+        result = cache.expire(budget=1)
+
+        self.assertEqual(1, result.checked)
+        self.assertEqual([(1, 1)], result)
+        self.assertEqual(1, len(cache))
+        self.assertEqual(2, cache.currsize)
 
     def test_ttu_expired(self):
         cache = TLRUCache[int, None, int](

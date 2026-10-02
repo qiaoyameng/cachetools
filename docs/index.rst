@@ -138,7 +138,7 @@ inserted into the cache.
 
       cache = TTLCache(maxsize=10, ttl=timedelta(hours=12), timer=datetime.now)
 
-   .. method:: expire(self, time=None)
+   .. method:: expire(self, time=None, budget=None)
 
       Expired items will be removed from a cache only at the next
       mutating operation, e.g. :meth:`__setitem__` or
@@ -149,7 +149,14 @@ inserted into the cache.
       items that have expired by the current value returned by
       :attr:`timer`.
 
-      :returns: An iterable of expired `(key, value)` pairs.
+      If `budget` is not :const:`None`, it limits the number of
+      expiration-order entries checked or removed by this call.
+      Expired items that are not removed yet remain inaccessible but do
+      not affect containment, iteration, length, or current size.
+      Stopping on the first still-valid item counts as one check.
+
+      :returns: A list of expired `(key, value)` pairs whose `checked`
+         attribute contains the number of entries checked.
 
 .. autoclass:: TLRUCache(maxsize, ttu, timer=time.monotonic, getsizeof=None)
    :members: popitem, timer, ttu
@@ -191,7 +198,7 @@ inserted into the cache.
    expired items are there to remove, the least recently used items
    will be discarded first to make space when necessary.
 
-   .. method:: expire(self, time=None)
+   .. method:: expire(self, time=None, budget=None)
 
       Expired items will be removed from a cache only at the next
       mutating operation, e.g. :meth:`__setitem__` or
@@ -202,7 +209,17 @@ inserted into the cache.
       items that have expired by the current value returned by
       :attr:`timer`.
 
-      :returns: An iterable of expired `(key, value)` pairs.
+      If `budget` is not :const:`None`, it limits the number of heap
+      entries checked or removed by this call.  Heap entries left behind
+      by replaced or deleted items are invalid and also count against
+      the budget; they are removed incrementally rather than triggering
+      an unbounded heap compaction.  Expired items that are not removed
+      yet remain inaccessible but do not affect containment, iteration,
+      length, or current size.  Stopping on the first still-valid item
+      counts as one check.
+
+      :returns: A list of expired `(key, value)` pairs whose `checked`
+         attribute contains the number of heap entries checked.
 
 
 Extending cache classes
@@ -237,7 +254,7 @@ expired items:
 .. doctest::
 
    >>> class ExpCache(TTLCache):
-   ...     def expire(self, time=None):
+   ...     def expire(self, time=None, budget=None):
    ...         items = super().expire(time)
    ...         print(f"Expired items: {items}")
    ...         return items
