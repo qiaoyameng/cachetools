@@ -1,3 +1,11 @@
+Unreleased
+==========
+
+- Add ``Cache.resize()`` and ``Cache.resize_many()`` methods to
+  re-measure the size of cached values after in-place modifications,
+  returning a ``ResizeInfo`` per key.
+
+
 v7.2.0 (2026-09-16)
 ===================
 

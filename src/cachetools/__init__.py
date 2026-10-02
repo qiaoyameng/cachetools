@@ -5,6 +5,7 @@ __all__ = (
     "FIFOCache",
     "LFUCache",
     "LRUCache",
+    "ResizeInfo",
     "RRCache",
     "TLRUCache",
     "TTLCache",
@@ -40,6 +41,28 @@ class _DefaultSize:
 
     def clear(self):
         pass
+
+
+class ResizeInfo(collections.namedtuple("ResizeInfo", ["status", "size"])):
+    """The outcome of re-measuring a single key with `Cache.resize()` or
+    `Cache.resize_many()`.
+
+    The `status` field is one of the following strings:
+
+    - `"resized"`: the key was re-measured and remains in the cache.
+    - `"missing"`: the key was not in the cache (e.g. never inserted or
+      already expired) and was not re-measured.
+    - `"removed"`: the re-measured size exceeds the cache's `maxsize`,
+      so the item was removed from the cache.
+    - `"evicted"`: the key was re-measured, but was subsequently
+      evicted to make room for other re-measured items.
+
+    The `size` field is the re-measured size of the value, or `None` if
+    the key was not re-measured.
+
+    """
+
+    __slots__ = ()
 
 
 class Cache(collections.abc.MutableMapping):
@@ -151,6 +174,79 @@ class Cache(collections.abc.MutableMapping):
         self.__data.clear()
         self.__size.clear()
         self.__currsize = 0
+
+    def resize(self, key):
+        """Re-measure the size of the value stored under `key` and update
+        the cache's size bookkeeping accordingly.
+
+        This is useful after mutating a cached value in place, e.g. by
+        growing a cached list, since the cache cannot detect such
+        changes itself.  Note that this cannot undo the modification of
+        the value; it merely re-measures it.
+
+        Return a `ResizeInfo` describing the outcome for `key`.  See
+        `resize_many()` for details.
+
+        """
+        return self.resize_many((key,))[key]
+
+    def resize_many(self, keys):
+        """Re-measure the sizes of the values stored under `keys` and
+        update the cache's size bookkeeping accordingly.
+
+        All sizes are computed before any bookkeeping is changed, so if
+        `getsizeof` raises an exception for any of the values, the
+        cache is left completely untouched.  Once all sizes have been
+        committed, items are evicted according to the cache's eviction
+        policy until `currsize` does not exceed `maxsize` anymore.  A
+        single value whose re-measured size exceeds `maxsize` is
+        removed from the cache instead.
+
+        Duplicate keys are measured only once, and keys that are not in
+        the cache (e.g. expired items) are reported as `"missing"`.
+
+        Return a dict mapping each requested key to a `ResizeInfo`, in
+        order of first occurrence in `keys`.
+
+        """
+        # phase 1: measure all requested keys before changing any
+        # bookkeeping, so a failing getsizeof cannot leave stale
+        # partial updates behind
+        order = []
+        sizes = {}
+        results = {}
+        cache_getitem = Cache.__getitem__
+        for key in keys:
+            if key in sizes or key in results:
+                continue  # duplicate keys are measured only once
+            order.append(key)
+            if key in self:
+                size = self.getsizeof(cache_getitem(self, key))
+                if size < 0:
+                    raise ValueError("value size must be non-negative")
+                sizes[key] = size
+            else:
+                results[key] = ResizeInfo("missing", None)
+        # phase 2: commit the new sizes
+        maxsize = self.__maxsize
+        for key, size in sizes.items():
+            if size > maxsize:
+                # a single value exceeding the total capacity can never
+                # be cached, so remove it
+                del self[key]
+                results[key] = ResizeInfo("removed", size)
+            else:
+                self.__currsize += size - self.__size[key]
+                self.__size[key] = size
+                results[key] = ResizeInfo("resized", size)
+        # phase 3: evict items according to the cache's eviction policy
+        # until the cache fits again
+        while self.__currsize > maxsize:
+            key, _ = self.popitem()
+            info = results.get(key)
+            if info is not None and info.status == "resized":
+                results[key] = ResizeInfo("evicted", info.size)
+        return {key: results[key] for key in order}
 
     @property
     def maxsize(self):
@@ -437,6 +533,12 @@ class _TimedCache(Cache):
     def setdefault(self, *args, **kwargs):
         with self.__timer:
             return Cache.setdefault(self, *args, **kwargs)
+
+    def resize_many(self, keys):
+        # freeze time for the whole batch so that expiry checks and
+        # item removal observe a consistent point in time
+        with self.__timer:
+            return Cache.resize_many(self, keys)
 
     def clear(self):
         # Subclasses must override to also reset their own time-tracking

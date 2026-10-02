@@ -1,5 +1,6 @@
 import unittest
 
+import cachetools
 from cachetools import LRUCache
 
 from . import CacheTestMixin
@@ -32,6 +33,43 @@ class LRUCacheTest(unittest.TestCase, CacheTestMixin):
         self.assertEqual(cache[4], 4)
         self.assertEqual(cache[5], 5)
         self.assertNotIn(2, cache)
+
+    def test_lru_resize_many_evict_order(self):
+        cache = LRUCache(maxsize=5, getsizeof=len)
+
+        a = [1, 2]
+        b = [1, 2]
+        c = [1]
+        cache["a"] = a
+        cache["b"] = b
+        cache["c"] = c
+        self.assertEqual(5, cache.currsize)
+        # LRU order: a (least recently used), b, c
+
+        c.extend([2, 3, 4])  # c grows to 4
+        results = cache.resize_many(["c"])
+
+        # total is now 2 + 2 + 4 = 8, so the least recently used items
+        # a and b are evicted in that order
+        self.assertEqual(cachetools.ResizeInfo("resized", 4), results["c"])
+        self.assertEqual(["c"], list(cache))
+        self.assertEqual(4, cache.currsize)
+
+    def test_lru_resize_evicted(self):
+        cache = LRUCache(maxsize=5, getsizeof=len)
+
+        a = [1, 2]
+        cache["a"] = a
+        cache["b"] = [1, 2, 3]
+        # LRU order: a (least recently used), b
+
+        a.extend([3, 4])  # a grows to 4 without touching the cache
+        results = cache.resize_many(["a"])
+
+        # total is now 4 + 3 = 7, so a itself is evicted
+        self.assertEqual(cachetools.ResizeInfo("evicted", 4), results["a"])
+        self.assertEqual(["b"], list(cache))
+        self.assertEqual(3, cache.currsize)
 
     def test_lru_getsizeof(self):
         cache = LRUCache[int, int](maxsize=3, getsizeof=lambda x: x)

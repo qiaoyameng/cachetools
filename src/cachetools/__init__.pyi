@@ -1,5 +1,5 @@
 import random
-from collections.abc import Callable, Iterator, MutableMapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, MutableMapping, Sequence
 from contextlib import AbstractContextManager
 from typing import (
     Any,
@@ -20,6 +20,7 @@ __all__: Final = (
     "FIFOCache",
     "LFUCache",
     "LRUCache",
+    "ResizeInfo",
     "RRCache",
     "TLRUCache",
     "TTLCache",
@@ -37,6 +38,10 @@ _TT = TypeVar("_TT", default=float)
 _KT2 = TypeVar("_KT2")
 _VT2 = TypeVar("_VT2")
 
+class ResizeInfo(NamedTuple):
+    status: str
+    size: float | None
+
 class Cache(MutableMapping[_KT, _VT]):
     def __init__(
         self, maxsize: float, getsizeof: Callable[[_VT], float] | None = None
@@ -52,6 +57,8 @@ class Cache(MutableMapping[_KT, _VT]):
     @overload
     def pop(self, key: _KT, default: _VT | _T) -> _VT | _T: ...
     def setdefault(self, key: _KT, default: _VT | None = None) -> _VT: ...
+    def resize(self, key: _KT) -> ResizeInfo: ...
+    def resize_many(self, keys: Iterable[_KT]) -> dict[_KT, ResizeInfo]: ...
     @property
     def maxsize(self) -> float: ...
     @property

@@ -366,6 +366,143 @@ class CacheTestMixin(_TestCaseProtocol):
 
         self._test_getsizeof(Cache(maxsize=3))
 
+    def test_resize(self):
+        cache = self.Cache(maxsize=10, getsizeof=len)
+
+        cache["a"] = [1, 2, 3]
+        cache["b"] = [1, 2]
+        self.assertEqual(5, cache.currsize)
+
+        # in-place modification is not tracked automatically
+        cache["a"].extend([4, 5, 6])
+        self.assertEqual(5, cache.currsize)
+
+        info = cache.resize("a")
+        self.assertEqual(cachetools.ResizeInfo("resized", 6), info)
+        self.assertEqual(8, cache.currsize)
+
+        info = cache.resize("missing")
+        self.assertEqual(cachetools.ResizeInfo("missing", None), info)
+        self.assertEqual(8, cache.currsize)
+
+    def test_resize_many_grow_shrink(self):
+        cache = self.Cache(maxsize=10, getsizeof=len)
+
+        cache["a"] = [1, 2, 3]
+        cache["b"] = [1, 2, 3, 4]
+        cache["c"] = [1]
+        self.assertEqual(8, cache.currsize)
+
+        cache["a"].extend([4, 5])  # grows to 5
+        del cache["b"][:2]  # shrinks to 2
+
+        results = cache.resize_many(["b", "a"])
+        self.assertEqual(cachetools.ResizeInfo("resized", 2), results["b"])
+        self.assertEqual(cachetools.ResizeInfo("resized", 5), results["a"])
+        self.assertEqual(8, cache.currsize)
+        self.assertIn("a", cache)
+        self.assertIn("b", cache)
+        self.assertIn("c", cache)
+
+    def test_resize_many_duplicate_keys(self):
+        count = 0
+
+        def getsizeof(value):
+            nonlocal count
+            count += 1
+            return len(value)
+
+        cache = self.Cache(maxsize=10, getsizeof=getsizeof)
+        cache["a"] = [1, 2]
+        count = 0
+
+        cache["a"].append(3)
+        results = cache.resize_many(["a", "a", "a"])
+        # duplicate keys are measured only once
+        self.assertEqual(1, count)
+        self.assertEqual(["a"], list(results))
+        self.assertEqual(cachetools.ResizeInfo("resized", 3), results["a"])
+        self.assertEqual(3, cache.currsize)
+
+    def test_resize_many_getsizeof_failure(self):
+        cache = self.Cache(maxsize=10, getsizeof=len)
+
+        a = [1, 2, 3]
+        b = [1, 2]
+        c = [1]
+        cache["a"] = a
+        cache["b"] = b
+        cache["c"] = c
+        self.assertEqual(6, cache.currsize)
+
+        a.append(4)  # grows to 4
+        c.extend([2, 3])  # grows to 3
+
+        def failing_getsizeof(value):
+            if value is c:
+                raise RuntimeError("cannot measure")
+            return len(value)
+
+        cache.getsizeof = failing_getsizeof
+        with self.assertRaises(RuntimeError):
+            cache.resize_many(["a", "c", "b"])
+
+        # the failure must not leave partial updates behind
+        self.assertEqual(6, cache.currsize)
+        self.assertEqual(3, len(cache))
+        self.assertIn("a", cache)
+        self.assertIn("b", cache)
+        self.assertIn("c", cache)
+
+        # re-measuring after the failure commits all sizes at once
+        cache.getsizeof = len
+        results = cache.resize_many(["a", "c", "b"])
+        self.assertEqual(cachetools.ResizeInfo("resized", 4), results["a"])
+        self.assertEqual(cachetools.ResizeInfo("resized", 3), results["c"])
+        self.assertEqual(cachetools.ResizeInfo("resized", 2), results["b"])
+        self.assertEqual(9, cache.currsize)
+
+    def test_resize_negative_size(self):
+        cache = self.Cache(maxsize=10, getsizeof=len)
+        cache["a"] = [1, 2]
+
+        cache.getsizeof = lambda value: -1
+        with self.assertRaises(ValueError):
+            cache.resize("a")
+        self.assertEqual(2, cache.currsize)
+        self.assertIn("a", cache)
+
+    def test_resize_oversized(self):
+        cache = self.Cache(maxsize=3, getsizeof=len)
+
+        cache["a"] = [1, 2]
+        cache["b"] = [1]
+        self.assertEqual(3, cache.currsize)
+
+        cache["a"].extend([3, 4])  # grows beyond maxsize
+        info = cache.resize("a")
+        self.assertEqual(cachetools.ResizeInfo("removed", 4), info)
+        self.assertNotIn("a", cache)
+        self.assertIn("b", cache)
+        self.assertEqual(1, cache.currsize)
+
+    def test_resize_many_evict(self):
+        cache = self.Cache(maxsize=5, getsizeof=len)
+
+        cache["a"] = [1, 2]
+        cache["b"] = [1, 2]
+        cache["c"] = [1]
+        self.assertEqual(5, cache.currsize)
+
+        cache["a"].extend([3, 4])  # grows to 4
+        results = cache.resize_many(["a"])
+        # sizes are now a=4, b=2, c=1, so items are evicted according
+        # to the cache's eviction policy until the cache fits again
+        self.assertTrue(len(cache) < 3)
+        self.assertTrue(cache.currsize <= 5)
+        expected = "resized" if "a" in cache else "evicted"
+        self.assertEqual(cachetools.ResizeInfo(expected, 4), results["a"])
+
     def test_clear(self):
         cache = self.Cache(maxsize=2)
         cache.update({1: 1, 2: 2})

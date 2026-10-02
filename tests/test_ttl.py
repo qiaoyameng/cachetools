@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from cachetools import TTLCache
+from cachetools import ResizeInfo, TTLCache
 
 from . import CacheTestMixin
 
@@ -27,6 +27,25 @@ class TTLTestCache(TTLCache):
 
 class TTLCacheTest(unittest.TestCase, CacheTestMixin):
     Cache = TTLTestCache
+
+    def test_resize_expired(self):
+        cache = TTLCache(maxsize=10, ttl=2, timer=Timer(), getsizeof=len)
+
+        cache[1] = [1, 2]
+        cache.timer.tick()  # time 1
+        cache[2] = [1]
+        cache.timer.tick()  # time 2: key 1 is now expired
+        self.assertNotIn(1, cache)
+        self.assertIn(2, cache)
+
+        cache[2].append(2)  # grows to 2
+        results = cache.resize_many([1, 2])
+
+        # expired items are reported as missing, live items are resized
+        self.assertEqual(ResizeInfo("missing", None), results[1])
+        self.assertEqual(ResizeInfo("resized", 2), results[2])
+        self.assertEqual(2, cache.currsize)
+        self.assertEqual([2], list(cache))
 
     def test_ttl(self):
         cache = TTLCache[int, int, int](maxsize=2, ttl=2, timer=Timer())

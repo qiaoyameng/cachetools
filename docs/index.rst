@@ -67,7 +67,7 @@ inserted into the cache.
    suitable `lock` object.
 
 .. autoclass:: Cache(maxsize, getsizeof=None)
-   :members: currsize, getsizeof, maxsize
+   :members: currsize, getsizeof, maxsize, resize, resize_many
 
    This class discards arbitrary items using :meth:`popitem` to make
    space when necessary.  Derived classes may override :meth:`popitem`
@@ -75,6 +75,8 @@ inserted into the cache.
    keep track of item access, insertion or deletion, it may
    additionally need to override :meth:`__getitem__`,
    :meth:`__setitem__` and :meth:`__delitem__`.
+
+.. autoclass:: ResizeInfo
 
 .. autoclass:: FIFOCache(maxsize, getsizeof=None)
    :members: popitem
